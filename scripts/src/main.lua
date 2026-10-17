@@ -36,7 +36,12 @@ end
 			"EGL",
 			"GLESv1_CM",
 			"GLESv2",
+			"GLESv3",
 			"SDL2",
+			"openxr_loader",
+		}
+		libdirs {
+			(os.getenv("OPENXR_SDK_ROOT") or "") .. "/lib",
 		}
 
 	configuration {  }

@@ -24,6 +24,13 @@ public class MAME extends SDLActivity {
 		copyAssetAll("language");
     }
 
+	@Override
+	protected void onDestroy() {
+		super.onDestroy();
+		// native state (OpenXR thread, MAME globals) can't be restarted in-process
+		android.os.Process.killProcess(android.os.Process.myPid());
+	}
+
 	public void copyAssetAll(String srcPath) {
 		AssetManager assetMgr = this.getAssets();
 		String assets[] = null;

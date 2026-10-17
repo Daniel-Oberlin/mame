@@ -158,6 +158,18 @@ function osdmodulesbuild()
 		ext_includedir("asio"),
 	}
 
+	if _OPTIONS["targetos"]=="android" then
+		files {
+			MAME_DIR .. "src/osd/modules/render/drawquest.cpp",
+			MAME_DIR .. "src/osd/quest/questxr.cpp",
+			MAME_DIR .. "src/osd/quest/questxr.h",
+		}
+		includedirs {
+			MAME_DIR .. "src/osd/quest",
+			(os.getenv("OPENXR_SDK_ROOT") or "") .. "/include",
+		}
+	end
+
 	if _OPTIONS["targetos"]=="windows" then
 		includedirs {
 			MAME_DIR .. "3rdparty/winpcap/Include",

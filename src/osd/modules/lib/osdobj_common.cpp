@@ -223,6 +223,9 @@ void osd_common_t::register_options()
 #endif
 	REGISTER_MODULE(m_mod_man, FONT_NONE);
 
+#if defined(SDLMAME_ANDROID)
+	REGISTER_MODULE(m_mod_man, RENDERER_QUEST); // OpenXR quad layer on Meta Quest
+#endif
 #if defined(SDLMAME_EMSCRIPTEN)
 	REGISTER_MODULE(m_mod_man, RENDERER_SDL1); // don't bother trying to use video acceleration in browsers
 #endif
