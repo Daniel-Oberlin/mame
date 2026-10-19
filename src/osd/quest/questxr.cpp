@@ -61,17 +61,16 @@ struct button_binding
 	SDL_GameControllerButton button;
 };
 
-// Touch controller -> standard gamepad layout. MAME's game controller support
-// then maps A/B/X/Y to buttons 1-4, Back to coin, Start to start and Guide to
-// its menu.
+// Touch controller -> standard gamepad layout, right hand leading: the right
+// stick drives the gamepad's primary (left) stick. MAME's game controller
+// support maps A/B to buttons 1-2 (and menu select/back), Back to coin, Start
+// to start and Guide to its menu.
 button_binding const BUTTONS[] = {
-	{ "a",     "/user/hand/right/input/a/click",          SDL_CONTROLLER_BUTTON_A },
-	{ "b",     "/user/hand/right/input/b/click",          SDL_CONTROLLER_BUTTON_B },
-	{ "x",     "/user/hand/left/input/x/click",           SDL_CONTROLLER_BUTTON_X },
-	{ "y",     "/user/hand/left/input/y/click",           SDL_CONTROLLER_BUTTON_Y },
-	{ "start", "/user/hand/left/input/menu/click",        SDL_CONTROLLER_BUTTON_START },
-	{ "coin",  "/user/hand/left/input/thumbstick/click",  SDL_CONTROLLER_BUTTON_BACK },
-	{ "guide", "/user/hand/right/input/thumbstick/click", SDL_CONTROLLER_BUTTON_GUIDE },
+	{ "a",     "/user/hand/right/input/a/click",   SDL_CONTROLLER_BUTTON_A },
+	{ "b",     "/user/hand/right/input/b/click",   SDL_CONTROLLER_BUTTON_B },
+	{ "coin",  "/user/hand/left/input/x/click",    SDL_CONTROLLER_BUTTON_BACK },
+	{ "start", "/user/hand/left/input/y/click",    SDL_CONTROLLER_BUTTON_START },
+	{ "guide", "/user/hand/left/input/menu/click", SDL_CONTROLLER_BUTTON_GUIDE },
 };
 
 struct frame
@@ -670,13 +669,13 @@ void quest_xr::sync_input()
 		m_pressed = pressed;
 	}
 
-	// OpenXR stick Y is up-positive, SDL's is down-positive
-	XrVector2f const left = get_vector(m_stick[0]);
-	XrVector2f const right = get_vector(m_stick[1]);
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTX, to_axis(left.x));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTY, to_axis(-left.y));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTX, to_axis(right.x));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTY, to_axis(-right.y));
+	// right stick is primary; OpenXR stick Y is up-positive, SDL's is down-positive
+	XrVector2f const primary = get_vector(m_stick[1]);
+	XrVector2f const secondary = get_vector(m_stick[0]);
+	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTX, to_axis(primary.x));
+	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTY, to_axis(-primary.y));
+	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTX, to_axis(secondary.x));
+	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTY, to_axis(-secondary.y));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, to_axis(get_float(m_trigger[0])));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, to_axis(get_float(m_trigger[1])));
 	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, (get_float(m_grip[0]) > PRESS_THRESHOLD) ? SDL_PRESSED : SDL_RELEASED);
