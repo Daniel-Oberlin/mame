@@ -163,6 +163,7 @@ private:
 	XrAction m_stick[2] = { };
 	XrAction m_trigger[2] = { };
 	XrAction m_grip[2] = { };
+	uint32_t m_pressed = 0;
 };
 
 quest_xr s_xr;
@@ -221,6 +222,9 @@ void quest_xr::end_frame()
 
 void quest_xr::attach_gamepad()
 {
+	// the headset's accelerometer would otherwise show up as a joystick
+	SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
+
 	// hold our own reference so the device survives MAME shutting down
 	// joystick support between machines
 	if (SDL_InitSubSystem(SDL_INIT_JOYSTICK))
@@ -652,8 +656,19 @@ void quest_xr::sync_input()
 	if (XR_FAILED(xrSyncActions(m_session, &sync)) || !m_pad)
 		return;
 
+	uint32_t pressed = 0;
 	for (size_t i = 0; i < std::size(BUTTONS); ++i)
-		SDL_JoystickSetVirtualButton(m_pad, BUTTONS[i].button, get_bool(m_buttons[i]) ? SDL_PRESSED : SDL_RELEASED);
+	{
+		bool const down = get_bool(m_buttons[i]);
+		SDL_JoystickSetVirtualButton(m_pad, BUTTONS[i].button, down ? SDL_PRESSED : SDL_RELEASED);
+		if (down)
+			pressed |= 1U << i;
+	}
+	if (pressed != m_pressed)
+	{
+		XRLOG("Buttons 0x%02x", pressed);
+		m_pressed = pressed;
+	}
 
 	// OpenXR stick Y is up-positive, SDL's is down-positive
 	XrVector2f const left = get_vector(m_stick[0]);

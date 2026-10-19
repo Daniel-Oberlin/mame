@@ -46,6 +46,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 // winnt.h defines this
 #ifdef DELETE
@@ -2130,6 +2131,22 @@ public:
 //  sdl_joystick_module_base
 //============================================================
 
+//============================================================
+//  joystick_enumeration_order
+//============================================================
+
+// Virtual joysticks (e.g. the Quest Touch controller bridge) are listed first
+// so they become joystick 1 and pick up the default input assignments.
+std::vector<int> joystick_enumeration_order()
+{
+	std::vector<int> order(SDL_NumJoysticks());
+	for (int i = 0; i < int(order.size()); i++)
+		order[i] = i;
+	std::stable_partition(order.begin(), order.end(), [] (int index) { return SDL_JoystickIsVirtual(index); });
+	return order;
+}
+
+
 class sdl_joystick_module_base : public sdl_input_module<sdl_joystick_device_base>
 {
 protected:
@@ -2306,7 +2323,7 @@ public:
 		sdl_joystick_module_base::input_init(machine);
 
 		osd_printf_verbose("Joystick: Start initialization\n");
-		for (int physical_stick = 0; physical_stick < SDL_NumJoysticks(); physical_stick++)
+		for (int const physical_stick : joystick_enumeration_order())
 			create_joystick_device(physical_stick, sixaxis_mode);
 
 		constexpr int event_types[] = {
@@ -2412,7 +2429,7 @@ public:
 		sdl_joystick_module_base::input_init(machine);
 
 		osd_printf_verbose("Game Controller: Start initialization\n");
-		for (int physical_stick = 0; physical_stick < SDL_NumJoysticks(); physical_stick++)
+		for (int const physical_stick : joystick_enumeration_order())
 		{
 			// try to open as a game controller
 			SDL_GameController *ctrl = nullptr;
