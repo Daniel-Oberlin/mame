@@ -2142,7 +2142,16 @@ std::vector<int> joystick_enumeration_order()
 	std::vector<int> order(SDL_NumJoysticks());
 	for (int i = 0; i < int(order.size()); i++)
 		order[i] = i;
-	std::stable_partition(order.begin(), order.end(), [] (int index) { return SDL_JoystickIsVirtual(index); });
+	auto const physical = std::stable_partition(order.begin(), order.end(), [] (int index) { return SDL_JoystickIsVirtual(index); });
+
+#if defined(SDLMAME_ANDROID)
+	// on Quest the system also exposes the Touch controllers as Android input
+	// devices with its own button layout; drop them when the bridge is present
+	constexpr Uint16 META_VENDOR_ID = 0x2833;
+	if (physical != order.begin())
+		order.erase(std::remove_if(physical, order.end(), [] (int index) { return SDL_JoystickGetDeviceVendor(index) == META_VENDOR_ID; }), order.end());
+#endif
+
 	return order;
 }
 
