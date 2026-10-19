@@ -480,6 +480,11 @@ void sdl_osd_interface::process_events()
 		// handle UI events
 		switch (event.type)
 		{
+		case SDL_QUIT:
+			// sent by the platform (e.g. quitting from the Quest system menu)
+			machine().schedule_exit();
+			break;
+
 		case SDL_WINDOWEVENT:
 			process_window_event(event);
 			break;
