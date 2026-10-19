@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -47,12 +48,22 @@ namespace osd::quest {
 
 namespace {
 
-// screen placement in the LOCAL reference space (metres, origin at the user's head)
+// initial screen placement in the LOCAL reference space (metres, origin at
+// the user's head)
 constexpr float SCREEN_DISTANCE = 2.0f;
 constexpr float SCREEN_HEIGHT = 1.2f;
 
-// analog trigger/grip travel at which they count as pressed
-constexpr float PRESS_THRESHOLD = 0.5f;
+// limits and rates for adjusting a grabbed screen with the stick
+constexpr float MIN_GRAB_DISTANCE = 0.3f;
+constexpr float MAX_GRAB_DISTANCE = 20.0f;
+constexpr float MIN_SCREEN_HEIGHT = 0.2f;
+constexpr float MAX_SCREEN_HEIGHT = 10.0f;
+constexpr float STICK_DEADZONE = 0.2f;
+constexpr float ADJUST_RATE = 1.0f; // e-folds per second at full deflection
+
+// grip travel that grabs the screen, and the lower travel that lets it go
+constexpr float GRAB_THRESHOLD = 0.5f;
+constexpr float RELEASE_THRESHOLD = 0.3f;
 
 struct button_binding
 {
@@ -71,6 +82,8 @@ button_binding const BUTTONS[] = {
 	{ "coin",  "/user/hand/left/input/x/click",    SDL_CONTROLLER_BUTTON_BACK },
 	{ "start", "/user/hand/left/input/y/click",    SDL_CONTROLLER_BUTTON_START },
 	{ "guide", "/user/hand/left/input/menu/click", SDL_CONTROLLER_BUTTON_GUIDE },
+	{ "l1",    "/user/hand/left/input/thumbstick/click",  SDL_CONTROLLER_BUTTON_LEFTSHOULDER },
+	{ "r1",    "/user/hand/right/input/thumbstick/click", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
 };
 
 struct frame
@@ -83,6 +96,40 @@ struct frame
 Sint16 to_axis(float value)
 {
 	return Sint16(std::clamp(value, -1.0f, 1.0f) * 32767.0f);
+}
+
+XrVector3f operator+(XrVector3f const &a, XrVector3f const &b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+XrVector3f operator-(XrVector3f const &a, XrVector3f const &b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+XrVector3f operator*(XrVector3f const &v, float s) { return { v.x * s, v.y * s, v.z * s }; }
+XrVector3f cross(XrVector3f const &a, XrVector3f const &b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+float length(XrVector3f const &v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+
+XrVector3f rotate(XrQuaternionf const &q, XrVector3f const &v)
+{
+	XrVector3f const u{ q.x, q.y, q.z };
+	XrVector3f const t = cross(u, v) * 2.0f;
+	return v + t * q.w + cross(u, t);
+}
+
+XrQuaternionf conjugate(XrQuaternionf const &q) { return { -q.x, -q.y, -q.z, q.w }; }
+
+// orientation whose +Z (the visible side of a quad) points along forward,
+// kept upright: yaw about world Y, then pitch, never roll
+XrQuaternionf facing(XrVector3f const &forward)
+{
+	float const yaw = std::atan2(forward.x, forward.z);
+	float const pitch = -std::atan2(forward.y, std::hypot(forward.x, forward.z));
+	float const cy = std::cos(yaw * 0.5f), sy = std::sin(yaw * 0.5f);
+	float const cp = std::cos(pitch * 0.5f), sp = std::sin(pitch * 0.5f);
+	// rotation about Y by yaw composed with rotation about X by pitch
+	return { cy * sp, sy * cp, -sy * sp, cy * cp };
+}
+
+float deadzone(float value)
+{
+	if (std::abs(value) < STICK_DEADZONE)
+		return 0.0f;
+	return (value - std::copysign(STICK_DEADZONE, value)) / (1.0f - STICK_DEADZONE);
 }
 
 
@@ -107,6 +154,8 @@ private:
 	void upload_frame();
 	void poll_events();
 	void sync_input();
+	void update_placement(XrTime time, XrDuration period);
+	void reset_placement();
 	void render_frame();
 	void shutdown();
 
@@ -162,7 +211,17 @@ private:
 	XrAction m_stick[2] = { };
 	XrAction m_trigger[2] = { };
 	XrAction m_grip[2] = { };
+	XrAction m_aim[2] = { };
+	XrSpace m_aim_space[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+	XrSpace m_view_space = XR_NULL_HANDLE;
 	uint32_t m_pressed = 0;
+
+	// screen placement in m_space; only the XR thread touches these
+	XrPosef m_screen_pose{ { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -SCREEN_DISTANCE } };
+	float m_screen_height = SCREEN_HEIGHT;
+	int m_grab_hand = -1;
+	XrVector3f m_grab_offset{ }; // screen centre in the grabbing hand's aim space
+	XrVector2f m_grab_stick{ };  // the grabbing hand's stick, kept away from MAME
 };
 
 quest_xr s_xr;
@@ -403,6 +462,9 @@ bool quest_xr::init_session()
 	space_info.poseInReferenceSpace.orientation.w = 1.0f;
 	if (XR_FAILED(xrCreateReferenceSpace(m_session, &space_info, &m_space)))
 		return false;
+	space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+	if (XR_FAILED(xrCreateReferenceSpace(m_session, &space_info, &m_view_space)))
+		return false;
 
 	// prefer an sRGB format: MAME's output is already gamma encoded
 	uint32_t format_count = 0;
@@ -455,9 +517,11 @@ bool quest_xr::init_actions()
 		m_stick[hand] = create_action((std::string("stick_") + hands[hand]).c_str(), XR_ACTION_TYPE_VECTOR2F_INPUT);
 		m_trigger[hand] = create_action((std::string("trigger_") + hands[hand]).c_str(), XR_ACTION_TYPE_FLOAT_INPUT);
 		m_grip[hand] = create_action((std::string("grip_") + hands[hand]).c_str(), XR_ACTION_TYPE_FLOAT_INPUT);
+		m_aim[hand] = create_action((std::string("aim_") + hands[hand]).c_str(), XR_ACTION_TYPE_POSE_INPUT);
 		suggest(bindings, m_stick[hand], (prefix + "thumbstick").c_str());
 		suggest(bindings, m_trigger[hand], (prefix + "trigger/value").c_str());
 		suggest(bindings, m_grip[hand], (prefix + "squeeze/value").c_str());
+		suggest(bindings, m_aim[hand], (prefix + "aim/pose").c_str());
 	}
 
 	XrPath profile = XR_NULL_PATH;
@@ -476,7 +540,18 @@ bool quest_xr::init_actions()
 	XrSessionActionSetsAttachInfo attach{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
 	attach.countActionSets = 1;
 	attach.actionSets = &m_action_set;
-	return XR_SUCCEEDED(xrAttachSessionActionSets(m_session, &attach));
+	if (XR_FAILED(xrAttachSessionActionSets(m_session, &attach)))
+		return false;
+
+	for (int hand = 0; hand < 2; ++hand)
+	{
+		XrActionSpaceCreateInfo space_info{ XR_TYPE_ACTION_SPACE_CREATE_INFO };
+		space_info.action = m_aim[hand];
+		space_info.poseInActionSpace.orientation.w = 1.0f;
+		if (XR_FAILED(xrCreateActionSpace(m_session, &space_info, &m_aim_space[hand])))
+			return false;
+	}
+	return true;
 }
 
 void quest_xr::init_passthrough()
@@ -610,6 +685,11 @@ void quest_xr::poll_events()
 		case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
 			m_exit = true;
 			break;
+		case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+			// recentring the view also brings the screen back in front
+			if (reinterpret_cast<XrEventDataReferenceSpaceChangePending const &>(event).referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL)
+				reset_placement();
+			break;
 		default:
 			break;
 		}
@@ -669,17 +749,86 @@ void quest_xr::sync_input()
 		m_pressed = pressed;
 	}
 
+	// the hand holding the screen uses its stick to adjust it instead
+	XrVector2f sticks[2] = { get_vector(m_stick[0]), get_vector(m_stick[1]) };
+	if (m_grab_hand >= 0)
+	{
+		m_grab_stick = sticks[m_grab_hand];
+		sticks[m_grab_hand] = { 0.0f, 0.0f };
+	}
+
 	// right stick is primary; OpenXR stick Y is up-positive, SDL's is down-positive
-	XrVector2f const primary = get_vector(m_stick[1]);
-	XrVector2f const secondary = get_vector(m_stick[0]);
+	XrVector2f const primary = sticks[1];
+	XrVector2f const secondary = sticks[0];
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTX, to_axis(primary.x));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTY, to_axis(-primary.y));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTX, to_axis(secondary.x));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTY, to_axis(-secondary.y));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, to_axis(get_float(m_trigger[0])));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, to_axis(get_float(m_trigger[1])));
-	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, (get_float(m_grip[0]) > PRESS_THRESHOLD) ? SDL_PRESSED : SDL_RELEASED);
-	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, (get_float(m_grip[1]) > PRESS_THRESHOLD) ? SDL_PRESSED : SDL_RELEASED);
+}
+
+void quest_xr::update_placement(XrTime time, XrDuration period)
+{
+	if (m_grab_hand >= 0 && get_float(m_grip[m_grab_hand]) < RELEASE_THRESHOLD)
+	{
+		XrVector3f const &p = m_screen_pose.position;
+		XRLOG("Screen placed at (%.2f, %.2f, %.2f), height %.2f m", p.x, p.y, p.z, m_screen_height);
+		m_grab_hand = -1;
+	}
+
+	XrSpaceLocation hand{ XR_TYPE_SPACE_LOCATION };
+	auto const located = [&hand, time, this] (int which)
+	{
+		XrSpaceLocationFlags const needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+		return XR_SUCCEEDED(xrLocateSpace(m_aim_space[which], m_space, time, &hand)) && ((hand.locationFlags & needed) == needed);
+	};
+
+	if (m_grab_hand < 0)
+	{
+		for (int which = 1; which >= 0; --which)
+		{
+			if (get_float(m_grip[which]) > GRAB_THRESHOLD && located(which))
+			{
+				m_grab_hand = which;
+				m_grab_offset = rotate(conjugate(hand.pose.orientation), m_screen_pose.position - hand.pose.position);
+				m_grab_stick = { 0.0f, 0.0f };
+				break;
+			}
+		}
+		return;
+	}
+
+	if (!located(m_grab_hand))
+		return;
+
+	// stick up/down pushes and pulls along the hand's reach, left/right resizes
+	float const seconds = float(period) * 1e-9f;
+	float const reach = length(m_grab_offset);
+	if (reach > 0.0f)
+	{
+		float const target = std::clamp(reach * std::exp(deadzone(m_grab_stick.y) * ADJUST_RATE * seconds), MIN_GRAB_DISTANCE, MAX_GRAB_DISTANCE);
+		m_grab_offset = m_grab_offset * (target / reach);
+	}
+	m_screen_height = std::clamp(m_screen_height * std::exp(deadzone(m_grab_stick.x) * ADJUST_RATE * seconds), MIN_SCREEN_HEIGHT, MAX_SCREEN_HEIGHT);
+
+	m_screen_pose.position = hand.pose.position + rotate(hand.pose.orientation, m_grab_offset);
+
+	// turn the screen to face the viewer
+	XrSpaceLocation head{ XR_TYPE_SPACE_LOCATION };
+	if (XR_SUCCEEDED(xrLocateSpace(m_view_space, m_space, time, &head)) && (head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+	{
+		XrVector3f const forward = head.pose.position - m_screen_pose.position;
+		if (length(forward) > 0.01f)
+			m_screen_pose.orientation = facing(forward);
+	}
+}
+
+void quest_xr::reset_placement()
+{
+	m_screen_pose = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -SCREEN_DISTANCE } };
+	m_screen_height = SCREEN_HEIGHT;
+	m_grab_hand = -1;
 }
 
 void quest_xr::render_frame()
@@ -691,6 +840,8 @@ void quest_xr::render_frame()
 	XrFrameBeginInfo begin_info{ XR_TYPE_FRAME_BEGIN_INFO };
 	if (XR_FAILED(xrBeginFrame(m_session, &begin_info)))
 		return;
+
+	update_placement(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
 
 	{
 		std::lock_guard<std::mutex> lock(m_frame_lock);
@@ -728,9 +879,8 @@ void quest_xr::render_frame()
 			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 			quad.subImage.swapchain = m_swapchain;
 			quad.subImage.imageRect = { { 0, 0 }, { m_sc_width, m_sc_height } };
-			quad.pose.orientation.w = 1.0f;
-			quad.pose.position = { 0.0f, 0.0f, -SCREEN_DISTANCE };
-			quad.size = { SCREEN_HEIGHT * aspect, SCREEN_HEIGHT };
+			quad.pose = m_screen_pose;
+			quad.size = { m_screen_height * aspect, m_screen_height };
 			layers[layer_count++] = reinterpret_cast<XrCompositionLayerBaseHeader const *>(&quad);
 		}
 	}
@@ -750,6 +900,15 @@ void quest_xr::shutdown()
 		m_xrDestroyPassthroughLayerFB(m_passthrough_layer);
 	if (m_passthrough != XR_NULL_HANDLE && m_xrDestroyPassthroughFB)
 		m_xrDestroyPassthroughFB(m_passthrough);
+	for (XrSpace &space : m_aim_space)
+	{
+		if (space != XR_NULL_HANDLE)
+			xrDestroySpace(space);
+		space = XR_NULL_HANDLE;
+	}
+	if (m_view_space != XR_NULL_HANDLE)
+		xrDestroySpace(m_view_space);
+	m_view_space = XR_NULL_HANDLE;
 	if (m_action_set != XR_NULL_HANDLE)
 		xrDestroyActionSet(m_action_set);
 	if (m_space != XR_NULL_HANDLE)
