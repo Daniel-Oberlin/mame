@@ -10,6 +10,10 @@
 #include "modules/lib/osdobj_common.h"
 #include "modules/osdmodule.h"
 
+#if defined(SDLMAME_ANDROID)
+#include "../quest/questxr.h"
+#endif
+
 #include <SDL2/SDL.h>
 
 #include <cassert>
@@ -159,7 +163,11 @@ public:
 	virtual void window_exit() override;
 
 	// SDL-specific
+#if defined(SDLMAME_ANDROID)
+	virtual bool has_focus() const override { return bool(m_focus_window) || osd::quest::xr_has_focus(); }
+#else
 	virtual bool has_focus() const override { return bool(m_focus_window); }
+#endif
 	void release_keys();
 	bool should_hide_mouse();
 	void process_events_buf();

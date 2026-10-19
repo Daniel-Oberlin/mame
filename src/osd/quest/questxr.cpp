@@ -28,6 +28,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <iterator>
@@ -92,6 +93,7 @@ public:
 	bool start();
 	uint32_t *begin_frame(int width, int height);
 	void end_frame();
+	bool has_focus() const { return m_focused; }
 
 private:
 	void attach_gamepad();
@@ -141,6 +143,7 @@ private:
 	XrSpace m_space = XR_NULL_HANDLE;
 	bool m_running = false;
 	bool m_exit = false;
+	std::atomic<bool> m_focused{ false };
 
 	int64_t m_format = 0;
 	XrSwapchain m_swapchain = XR_NULL_HANDLE;
@@ -203,6 +206,14 @@ uint32_t *quest_xr::begin_frame(int width, int height)
 
 void quest_xr::end_frame()
 {
+	// GL textures are stored bottom row first
+	int const width = m_back->width;
+	for (int top = 0, bottom = m_back->height - 1; top < bottom; ++top, --bottom)
+	{
+		uint32_t *const toprow = &m_back->pixels[size_t(top) * width];
+		std::swap_ranges(toprow, toprow + width, &m_back->pixels[size_t(bottom) * width]);
+	}
+
 	std::lock_guard<std::mutex> lock(m_frame_lock);
 	std::swap(m_back, m_ready);
 	m_ready_fresh = true;
@@ -570,6 +581,7 @@ void quest_xr::poll_events()
 			{
 				auto const &change = reinterpret_cast<XrEventDataSessionStateChanged const &>(event);
 				XRLOG("Session state %d", change.state);
+				m_focused = (change.state == XR_SESSION_STATE_FOCUSED);
 				switch (change.state)
 				{
 				case XR_SESSION_STATE_READY:
@@ -767,6 +779,11 @@ uint32_t *xr_begin_frame(int width, int height)
 void xr_end_frame()
 {
 	s_xr.end_frame();
+}
+
+bool xr_has_focus()
+{
+	return s_xr.has_focus();
 }
 
 } // namespace osd::quest

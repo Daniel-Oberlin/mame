@@ -28,6 +28,10 @@ uint32_t *xr_begin_frame(int width, int height);
 // Publishes the frame drawn since xr_begin_frame to the compositor.
 void xr_end_frame();
 
+// True while the XR session has input focus. The Android window never gets
+// focus in immersive mode, so this stands in for it.
+bool xr_has_focus();
+
 } // namespace osd::quest
 
 #endif // MAME_OSD_QUEST_QUESTXR_H
