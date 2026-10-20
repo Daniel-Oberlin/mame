@@ -28,6 +28,11 @@ uint32_t *xr_begin_frame(int width, int height);
 // Publishes the frame drawn since xr_begin_frame to the compositor.
 void xr_end_frame();
 
+// How many display pixels the screen's longest edge currently spans in the
+// user's view, or 0 if not yet known. Lets the renderer match its resolution
+// to how big the screen looks.
+int xr_screen_pixels();
+
 // True while the XR session has input focus. The Android window never gets
 // focus in immersive mode, so this stands in for it.
 bool xr_has_focus();

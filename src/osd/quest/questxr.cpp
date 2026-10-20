@@ -62,6 +62,10 @@ constexpr float MAX_SCREEN_HEIGHT = 10.0f;
 constexpr float STICK_DEADZONE = 0.2f;
 constexpr float ADJUST_RATE = 1.0f; // e-folds per second at full deflection
 
+// approximate display density at the centre of the Quest 3 view, used to
+// work out how many pixels the screen covers
+constexpr float PIXELS_PER_DEGREE = 25.0f;
+
 // grip travel that grabs the screen, and the lower travel that lets it go
 constexpr float GRAB_THRESHOLD = 0.5f;
 constexpr float RELEASE_THRESHOLD = 0.3f;
@@ -146,6 +150,7 @@ public:
 	uint32_t *begin_frame(int width, int height);
 	void end_frame();
 	bool has_focus() const { return m_focused; }
+	int screen_pixels() const { return m_screen_pixels; }
 
 private:
 	void attach_gamepad();
@@ -155,6 +160,7 @@ private:
 	bool init_session();
 	bool init_actions();
 	void init_passthrough();
+	void set_refresh_rate();
 	bool ensure_swapchain(int width, int height);
 	void destroy_swapchain();
 	void upload_frame();
@@ -162,6 +168,7 @@ private:
 	void sync_input();
 	void update_placement(XrTime time, XrDuration period);
 	void reset_placement();
+	void update_screen_pixels(XrTime time);
 	void render_frame();
 	void shutdown();
 
@@ -198,6 +205,7 @@ private:
 	bool m_running = false;
 	bool m_exit = false;
 	std::atomic<bool> m_focused{ false };
+	std::atomic<int> m_screen_pixels{ 0 };
 
 	int64_t m_format = 0;
 	XrSwapchain m_swapchain = XR_NULL_HANDLE;
@@ -207,6 +215,9 @@ private:
 	std::vector<XrSwapchainImageOpenGLESKHR> m_sc_images;
 
 	bool m_has_passthrough_ext = false;
+	bool m_has_refresh_rate_ext = false;
+	bool m_has_layer_settings_ext = false;
+	bool m_has_auto_filter_ext = false;
 	XrPassthroughFB m_passthrough = XR_NULL_HANDLE;
 	XrPassthroughLayerFB m_passthrough_layer = XR_NULL_HANDLE;
 	PFN_xrDestroyPassthroughFB m_xrDestroyPassthroughFB = nullptr;
@@ -426,6 +437,9 @@ bool quest_xr::init_instance()
 		return std::any_of(available.begin(), available.end(), [name] (auto const &ext) { return !std::strcmp(ext.extensionName, name); });
 	};
 	m_has_passthrough_ext = has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+	m_has_refresh_rate_ext = has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+	m_has_layer_settings_ext = has_extension(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
+	m_has_auto_filter_ext = m_has_layer_settings_ext && has_extension(XR_META_AUTOMATIC_LAYER_FILTER_EXTENSION_NAME);
 	auto const &anchor_extensions = screen_anchor::extensions();
 	m_has_anchor_ext = std::all_of(anchor_extensions.begin(), anchor_extensions.end(), has_extension);
 
@@ -434,6 +448,12 @@ bool quest_xr::init_instance()
 			XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
 	if (m_has_passthrough_ext)
 		extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+	if (m_has_refresh_rate_ext)
+		extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+	if (m_has_layer_settings_ext)
+		extensions.push_back(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
+	if (m_has_auto_filter_ext)
+		extensions.push_back(XR_META_AUTOMATIC_LAYER_FILTER_EXTENSION_NAME);
 	if (m_has_anchor_ext)
 		extensions.insert(extensions.end(), anchor_extensions.begin(), anchor_extensions.end());
 
@@ -615,6 +635,29 @@ void quest_xr::init_passthrough()
 		m_passthrough_layer = XR_NULL_HANDLE;
 }
 
+void quest_xr::set_refresh_rate()
+{
+	// arcade games mostly run near 60Hz; the highest rate (120Hz on Quest 3)
+	// shows each of their frames twice, which judders least
+	if (!m_has_refresh_rate_ext)
+		return;
+	PFN_xrEnumerateDisplayRefreshRatesFB enumerate = nullptr;
+	PFN_xrRequestDisplayRefreshRateFB request = nullptr;
+	xrGetInstanceProcAddr(m_instance, "xrEnumerateDisplayRefreshRatesFB", reinterpret_cast<PFN_xrVoidFunction *>(&enumerate));
+	xrGetInstanceProcAddr(m_instance, "xrRequestDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction *>(&request));
+	if (!enumerate || !request)
+		return;
+	uint32_t count = 0;
+	enumerate(m_session, 0, &count, nullptr);
+	std::vector<float> rates(count);
+	enumerate(m_session, count, &count, rates.data());
+	if (rates.empty())
+		return;
+	float const best = *std::max_element(rates.begin(), rates.end());
+	XrResult const result = request(m_session, best);
+	XRLOG("Display refresh rate %.0f Hz requested: %d", best, result);
+}
+
 bool quest_xr::ensure_swapchain(int width, int height)
 {
 	if (m_swapchain != XR_NULL_HANDLE && m_sc_width == width && m_sc_height == height)
@@ -698,6 +741,8 @@ void quest_xr::poll_events()
 						XrSessionBeginInfo begin{ XR_TYPE_SESSION_BEGIN_INFO };
 						begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 						m_running = XR_SUCCEEDED(xrBeginSession(m_session, &begin));
+						if (m_running)
+							set_refresh_rate();
 					}
 					break;
 				case XR_SESSION_STATE_STOPPING:
@@ -839,6 +884,8 @@ void quest_xr::update_placement(XrTime time, XrDuration period)
 		return XR_SUCCEEDED(xrLocateSpace(m_aim_space[which], m_space, time, &hand)) && ((hand.locationFlags & needed) == needed);
 	};
 
+	update_screen_pixels(time);
+
 	if (m_grab_hand < 0)
 	{
 		if (m_reanchor)
@@ -890,6 +937,18 @@ void quest_xr::update_placement(XrTime time, XrDuration period)
 	}
 }
 
+void quest_xr::update_screen_pixels(XrTime time)
+{
+	XrSpaceLocation head{ XR_TYPE_SPACE_LOCATION };
+	if (XR_FAILED(xrLocateSpace(m_view_space, m_space, time, &head)) || !(head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+		return;
+	float const distance = std::max(length(m_screen_pose.position - head.pose.position), 0.1f);
+	float const aspect = (m_sc_width > 0 && m_sc_height > 0) ? float(m_sc_width) / float(m_sc_height) : 4.0f / 3.0f;
+	float const edge = m_screen_height * std::max(aspect, 1.0f);
+	float const degrees = 2.0f * std::atan(0.5f * edge / distance) * (180.0f / 3.14159265f);
+	m_screen_pixels = int(degrees * PIXELS_PER_DEGREE);
+}
+
 void quest_xr::reset_placement()
 {
 	m_screen_pose = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -SCREEN_DISTANCE } };
@@ -932,6 +991,21 @@ void quest_xr::render_frame()
 	}
 
 	XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
+	XrCompositionLayerSettingsFB settings{ XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB };
+	if (m_has_auto_filter_ext)
+	{
+		// let the compositor choose between supersampling (screen shown smaller
+		// than its texture) and sharpening (shown larger)
+		settings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_AUTO_LAYER_FILTER_BIT_META |
+				XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB |
+				XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB;
+		quad.next = &settings;
+	}
+	else if (m_has_layer_settings_ext)
+	{
+		settings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB;
+		quad.next = &settings;
+	}
 	if (frame_state.shouldRender && m_front->width > 0 && m_front->height > 0 && ensure_swapchain(m_front->width, m_front->height))
 	{
 		if (m_front_fresh || !m_sc_has_content)
@@ -1020,6 +1094,11 @@ uint32_t *xr_begin_frame(int width, int height)
 void xr_end_frame()
 {
 	s_xr.end_frame();
+}
+
+int xr_screen_pixels()
+{
+	return s_xr.screen_pixels();
 }
 
 bool xr_has_focus()
