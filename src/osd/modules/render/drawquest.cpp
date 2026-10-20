@@ -4,11 +4,13 @@
 //
 //  drawquest.cpp - Meta Quest renderer
 //
-//  Rasterises the primitive list in software at an integer multiple
-//  of the game's native resolution and hands the frame to the OpenXR
-//  thread, which shows it on a quad layer. The multiple follows how
-//  many display pixels the screen covers, so a big or close screen gets
-//  more detail (mostly visible in vector games).
+//  Rasterises the primitive list in software and hands the frame to the
+//  OpenXR thread, which scales it onto the screen on the GPU. While only
+//  the game screen is showing, frames go out at the game's own resolution
+//  so the GPU can upscale them (with an optional CRT look). With menus,
+//  artwork or vectors on screen they are drawn at an integer multiple of
+//  the native size matched to how big the screen looks, keeping text and
+//  vector lines sharp.
 //
 //============================================================
 
@@ -63,11 +65,17 @@ public:
 
 private:
 	int pick_scale(int edge);
+	void classify(render_primitive_list &primlist);
 
 	int m_width = 0;
 	int m_height = 0;
 	int m_scale = 0;
 	int m_edge = 0;
+	float m_aspect = 1.0f;
+
+	// whether the last frame held nothing but one raster game screen
+	bool m_native = false;
+	bool m_vertical = false;
 
 	std::chrono::steady_clock::duration m_draw_time{ };
 	int m_draw_count = 0;
@@ -89,42 +97,83 @@ int renderer_quest::pick_scale(int edge)
 	return std::clamp(int(wanted + 0.5f), 1, max_scale);
 }
 
+void renderer_quest::classify(render_primitive_list &primlist)
+{
+	int screens = 0;
+	bool others = false;
+	for (render_primitive const *prim = primlist.first(); prim; prim = prim->next())
+	{
+		bool const raster_screen = (prim->type == render_primitive::QUAD) && prim->texture.base &&
+				(prim->flags & PRIMFLAG_SCREENTEX_MASK) && !(prim->flags & (PRIMFLAG_VECTOR_MASK | PRIMFLAG_VECTORBUF_MASK));
+		if (raster_screen)
+		{
+			++screens;
+			m_vertical = (PRIMFLAG_GET_TEXORIENT(prim->flags) & ORIENTATION_SWAP_XY) != 0;
+		}
+		else
+		{
+			others = true;
+		}
+	}
+	m_native = (screens == 1) && !others;
+}
+
 render_primitive_list *renderer_quest::get_primitives()
 {
 	render_target &target = *window().target();
 
-	// scale by a whole number so every source pixel covers the same area
 	s32 minwidth, minheight;
 	target.compute_minimum_size(minwidth, minheight);
-	int const edge = std::max(std::max(minwidth, minheight), 1);
-	int const scale = m_scale = pick_scale(edge);
+	minwidth = std::max(minwidth, 1);
+	minheight = std::max(minheight, 1);
 
-	// trim to the area the layout fills, so the quad takes the game's aspect ratio
+	// shape of the layout on screen, which the quad takes
+	s32 shape_width, shape_height;
+	target.compute_visible_area(4096, 4096, 1.0f, target.orientation(), shape_width, shape_height);
+	m_aspect = float(std::max(shape_width, 1)) / float(std::max(shape_height, 1));
+
 	s32 visible_width, visible_height;
-	target.compute_visible_area(minwidth * scale, minheight * scale, 1.0f, target.orientation(), visible_width, visible_height);
-	m_width = std::max(visible_width, 1);
-	m_height = std::max(visible_height, 1);
-
-	target.set_bounds(m_width, m_height, 1.0f);
+	if (m_native)
+	{
+		// one texel per game pixel: describe pixels as stretched however far
+		// it takes for the native size to fill the layout exactly
+		float const pixel_aspect = m_aspect * float(minheight) / float(minwidth);
+		target.compute_visible_area(minwidth, minheight, pixel_aspect, target.orientation(), visible_width, visible_height);
+		m_width = std::max(visible_width, 1);
+		m_height = std::max(visible_height, 1);
+		target.set_bounds(m_width, m_height, pixel_aspect);
+	}
+	else
+	{
+		// scale by a whole number so every source pixel covers the same area,
+		// then trim to the area the layout fills
+		int const scale = m_scale = pick_scale(std::max(minwidth, minheight));
+		target.compute_visible_area(minwidth * scale, minheight * scale, 1.0f, target.orientation(), visible_width, visible_height);
+		m_width = std::max(visible_width, 1);
+		m_height = std::max(visible_height, 1);
+		target.set_bounds(m_width, m_height, 1.0f);
+	}
 	return &target.get_primitives();
 }
 
 int renderer_quest::draw(const int update)
 {
 	auto const start = std::chrono::steady_clock::now();
+	bool const native = m_native;
 	uint32_t *const pixels = quest::xr_begin_frame(m_width, m_height);
 	std::fill_n(pixels, size_t(m_width) * size_t(m_height), 0);
 
 	window().m_primlist->acquire_lock();
 	software_renderer<uint32_t, 0,0,0, 0,8,16>::draw_primitives(*window().m_primlist, pixels, m_width, m_height, m_width);
+	classify(*window().m_primlist);
 	window().m_primlist->release_lock();
 
-	quest::xr_end_frame();
+	quest::xr_end_frame(m_aspect, native, m_vertical);
 
 	m_draw_time += std::chrono::steady_clock::now() - start;
 	if (++m_draw_count == TIMING_INTERVAL)
 	{
-		__android_log_print(ANDROID_LOG_INFO, "MAMEQuest", "Renderer %dx%d (x%d), %.2f ms per frame", m_width, m_height, m_scale,
+		__android_log_print(ANDROID_LOG_INFO, "MAMEQuest", "Renderer %dx%d (%s), %.2f ms per frame", m_width, m_height, native ? "native" : "scaled",
 				std::chrono::duration<double, std::milli>(m_draw_time).count() / m_draw_count);
 		m_draw_time = { };
 		m_draw_count = 0;

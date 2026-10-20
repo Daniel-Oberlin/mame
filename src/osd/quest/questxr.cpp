@@ -5,7 +5,8 @@
 //  questxr.cpp - OpenXR presentation and controller input for Meta Quest
 //
 //  The emulated screen is shown as a compositor quad layer floating in
-//  front of the user, over passthrough when available. Touch controller
+//  front of the user, over passthrough when available. Frames are scaled
+//  into the quad's swapchain on the GPU, optionally with a CRT look. Touch controller
 //  state is read through OpenXR actions and fed to an SDL virtual game
 //  controller, so MAME sees an ordinary gamepad.
 //
@@ -32,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -65,6 +67,14 @@ constexpr float ADJUST_RATE = 1.0f; // e-folds per second at full deflection
 // approximate display density at the centre of the Quest 3 view, used to
 // work out how many pixels the screen covers
 constexpr float PIXELS_PER_DEGREE = 25.0f;
+
+// swapchain size limits (longest edge), the minimum swapchain pixels per
+// scanline for the CRT look, and how far the wanted size must drift before
+// the swapchain is recreated
+constexpr int MIN_SWAPCHAIN_EDGE = 512;
+constexpr int MAX_SWAPCHAIN_EDGE = 2048;
+constexpr int CRT_PIXELS_PER_LINE = 3;
+constexpr float SWAPCHAIN_SLACK = 0.2f;
 
 // grip travel that grabs the screen, and the lower travel that lets it go
 constexpr float GRAB_THRESHOLD = 0.5f;
@@ -101,7 +111,91 @@ struct frame
 	std::vector<uint32_t> pixels;
 	int width = 0;
 	int height = 0;
+	float aspect = 1.0f;
+	bool native = false;
+	bool vertical = false;
 };
+
+enum : int { MODE_SMOOTH = 0, MODE_PIXELS = 1, MODE_CRT = 2 };
+
+char const VERTEX_SHADER[] = R"glsl(#version 300 es
+out vec2 v_uv;
+void main()
+{
+	// one triangle covering the viewport; source row 0 is the top of the picture
+	vec2 pos = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+	v_uv = vec2(pos.x, 1.0 - pos.y);
+	gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
+}
+)glsl";
+
+// Works in linear light: the source texture decodes sRGB on sampling and the
+// swapchain encodes it again on writing.
+char const FRAGMENT_SHADER[] = R"glsl(#version 300 es
+precision highp float;
+uniform sampler2D u_source;
+uniform vec2 u_source_size;   // texels
+uniform vec2 u_output_size;   // swapchain pixels
+uniform int u_mode;
+uniform bool u_vertical;      // scanlines run along the picture's columns
+uniform float u_scanlines;    // 0 when scanlines are too fine to show on the display
+in vec2 v_uv;
+out vec4 o_color;
+
+// bilinear only within a pixel's edges: crisp blocks without uneven widths
+vec3 pixels(vec2 uv)
+{
+	vec2 texel = uv * u_source_size;
+	vec2 scale = max(floor(u_output_size / u_source_size), vec2(1.0));
+	vec2 centre = fract(texel) - 0.5;
+	vec2 range = 0.5 - 0.5 / scale;
+	vec2 offset = (centre - clamp(centre, -range, range)) * scale + 0.5;
+	return texture(u_source, (floor(texel) + offset) / u_source_size).rgb;
+}
+
+// one sample on a scanline; along the line the beam blurs a little
+vec3 beam_sample(float along, float line, vec2 size)
+{
+	float cell = floor(along);
+	float soft = cell + 0.5 + clamp((fract(along) - 0.5) * 1.5, -0.5, 0.5);
+	vec2 at = vec2(soft, line + 0.5);
+	if (u_vertical)
+		at = at.yx;
+	return texture(u_source, at / u_source_size).rgb;
+}
+
+// brighter lines are drawn by a wider beam
+vec3 beam_weight(float distance, vec3 colour)
+{
+	vec3 width = mix(vec3(0.22), vec3(0.42), sqrt(colour));
+	return exp(-0.5 * distance * distance / (width * width));
+}
+
+vec3 crt(vec2 uv)
+{
+	vec2 size = u_vertical ? u_source_size.yx : u_source_size;
+	vec2 p = (u_vertical ? uv.yx : uv) * size;   // x along the scanline, y across
+	float line = floor(p.y);
+	float offset = p.y - line - 0.5;
+	float neighbour = clamp(line + (offset < 0.0 ? -1.0 : 1.0), 0.0, size.y - 1.0);
+	vec3 near = beam_sample(p.x, line, size);
+	vec3 far = beam_sample(p.x, neighbour, size);
+	vec3 colour = near * beam_weight(abs(offset), near) + far * beam_weight(1.0 - abs(offset), far);
+	return mix(pixels(uv), min(colour * 1.2, vec3(1.0)), u_scanlines);
+}
+
+void main()
+{
+	vec3 colour;
+	if (u_mode == 2)
+		colour = crt(v_uv);
+	else if (u_mode == 1)
+		colour = pixels(v_uv);
+	else
+		colour = texture(u_source, v_uv).rgb;
+	o_color = vec4(colour, 1.0);
+}
+)glsl";
 
 Sint16 to_axis(float value)
 {
@@ -148,7 +242,7 @@ class quest_xr
 public:
 	bool start();
 	uint32_t *begin_frame(int width, int height);
-	void end_frame();
+	void end_frame(float aspect, bool native, bool vertical);
 	bool has_focus() const { return m_focused; }
 	int screen_pixels() const { return m_screen_pixels; }
 
@@ -161,9 +255,14 @@ private:
 	bool init_actions();
 	void init_passthrough();
 	void set_refresh_rate();
+	bool init_gl();
 	bool ensure_swapchain(int width, int height);
 	void destroy_swapchain();
+	void choose_swapchain_size(int &width, int &height) const;
 	void upload_frame();
+	void draw_screen();
+	void load_settings();
+	void save_settings() const;
 	void poll_events();
 	void sync_input();
 	void update_placement(XrTime time, XrDuration period);
@@ -208,6 +307,21 @@ private:
 	std::atomic<int> m_screen_pixels{ 0 };
 
 	int64_t m_format = 0;
+	GLuint m_program = 0;
+	GLuint m_vao = 0;
+	GLuint m_fbo = 0;
+	GLuint m_source = 0;
+	int m_source_width = 0;
+	int m_source_height = 0;
+	GLint m_u_source_size = -1;
+	GLint m_u_output_size = -1;
+	GLint m_u_mode = -1;
+	GLint m_u_vertical = -1;
+	GLint m_u_scanlines = -1;
+	bool m_crt = true;
+	bool m_redraw = false;
+	bool m_trigger_was_down = false;
+
 	XrSwapchain m_swapchain = XR_NULL_HANDLE;
 	int m_sc_width = 0;
 	int m_sc_height = 0;
@@ -277,6 +391,7 @@ bool quest_xr::start()
 	env->GetJavaVM(&m_vm);
 	if (char const *const dir = SDL_AndroidGetExternalStoragePath())
 		m_files_dir = dir;
+	load_settings();
 	m_activity = env->NewGlobalRef(activity);
 	env->DeleteLocalRef(activity);
 
@@ -296,15 +411,11 @@ uint32_t *quest_xr::begin_frame(int width, int height)
 	return m_back->pixels.data();
 }
 
-void quest_xr::end_frame()
+void quest_xr::end_frame(float aspect, bool native, bool vertical)
 {
-	// GL textures are stored bottom row first
-	int const width = m_back->width;
-	for (int top = 0, bottom = m_back->height - 1; top < bottom; ++top, --bottom)
-	{
-		uint32_t *const toprow = &m_back->pixels[size_t(top) * width];
-		std::swap_ranges(toprow, toprow + width, &m_back->pixels[size_t(bottom) * width]);
-	}
+	m_back->aspect = aspect;
+	m_back->native = native;
+	m_back->vertical = vertical;
 
 	std::lock_guard<std::mutex> lock(m_frame_lock);
 	std::swap(m_back, m_ready);
@@ -353,7 +464,7 @@ void quest_xr::run()
 	JNIEnv *env = nullptr;
 	m_vm->AttachCurrentThread(&env, nullptr);
 
-	if (init_egl() && init_instance() && init_session() && init_actions())
+	if (init_egl() && init_gl() && init_instance() && init_session() && init_actions())
 	{
 		init_passthrough();
 		if (m_has_anchor_ext && !m_files_dir.empty())
@@ -414,6 +525,54 @@ bool quest_xr::init_egl()
 	EGLint const surface_attribs[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
 	m_egl_surface = eglCreatePbufferSurface(m_egl_display, m_egl_config, surface_attribs);
 	return eglMakeCurrent(m_egl_display, m_egl_surface, m_egl_surface, m_egl_context);
+}
+
+bool quest_xr::init_gl()
+{
+	auto const compile = [] (GLenum type, char const *source)
+	{
+		GLuint const shader = glCreateShader(type);
+		glShaderSource(shader, 1, &source, nullptr);
+		glCompileShader(shader);
+		GLint ok = GL_FALSE;
+		glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+		if (!ok)
+		{
+			char log[1024];
+			glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+			XRERR("Shader compile failed: %s", log);
+		}
+		return shader;
+	};
+	GLuint const vertex = compile(GL_VERTEX_SHADER, VERTEX_SHADER);
+	GLuint const fragment = compile(GL_FRAGMENT_SHADER, FRAGMENT_SHADER);
+	m_program = glCreateProgram();
+	glAttachShader(m_program, vertex);
+	glAttachShader(m_program, fragment);
+	glLinkProgram(m_program);
+	glDeleteShader(vertex);
+	glDeleteShader(fragment);
+	GLint linked = GL_FALSE;
+	glGetProgramiv(m_program, GL_LINK_STATUS, &linked);
+	if (!linked)
+	{
+		char log[1024];
+		glGetProgramInfoLog(m_program, sizeof(log), nullptr, log);
+		XRERR("Shader link failed: %s", log);
+		return false;
+	}
+	glUseProgram(m_program);
+	glUniform1i(glGetUniformLocation(m_program, "u_source"), 0);
+	m_u_source_size = glGetUniformLocation(m_program, "u_source_size");
+	m_u_output_size = glGetUniformLocation(m_program, "u_output_size");
+	m_u_mode = glGetUniformLocation(m_program, "u_mode");
+	m_u_vertical = glGetUniformLocation(m_program, "u_vertical");
+	m_u_scanlines = glGetUniformLocation(m_program, "u_scanlines");
+
+	glGenVertexArrays(1, &m_vao);
+	glGenFramebuffers(1, &m_fbo);
+	glGenTextures(1, &m_source);
+	return true;
 }
 
 bool quest_xr::init_instance()
@@ -701,7 +860,68 @@ void quest_xr::destroy_swapchain()
 	m_sc_has_content = false;
 }
 
+void quest_xr::choose_swapchain_size(int &width, int &height) const
+{
+	// as many pixels as the screen covers on the display, and enough per
+	// scanline for the CRT look to resolve them
+	int edge = std::clamp(m_screen_pixels.load(), MIN_SWAPCHAIN_EDGE, MAX_SWAPCHAIN_EDGE);
+	if (m_front->native && m_crt)
+	{
+		int const lines = std::max(m_front->width, m_front->height);
+		edge = std::clamp(std::max(edge, lines * CRT_PIXELS_PER_LINE), MIN_SWAPCHAIN_EDGE, MAX_SWAPCHAIN_EDGE);
+	}
+	float const aspect = m_front->aspect;
+	if (aspect >= 1.0f)
+	{
+		width = edge;
+		height = std::max(int(float(edge) / aspect + 0.5f), 1);
+	}
+	else
+	{
+		height = edge;
+		width = std::max(int(float(edge) * aspect + 0.5f), 1);
+	}
+
+	// keep the current swapchain unless its shape changed or its size is well off
+	// (and never resize mid-grab, when the size changes continuously)
+	if (m_swapchain != XR_NULL_HANDLE)
+	{
+		float const current_aspect = float(m_sc_width) / float(m_sc_height);
+		bool const same_shape = std::abs(current_aspect - float(width) / float(height)) < 0.01f * current_aspect;
+		int const current_edge = std::max(m_sc_width, m_sc_height);
+		bool const close = std::abs(edge - current_edge) < int(SWAPCHAIN_SLACK * float(current_edge));
+		if (same_shape && (close || m_grab_hand >= 0))
+		{
+			width = m_sc_width;
+			height = m_sc_height;
+		}
+	}
+}
+
 void quest_xr::upload_frame()
+{
+	glBindTexture(GL_TEXTURE_2D, m_source);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	if (m_front->width != m_source_width || m_front->height != m_source_height)
+	{
+		// sampling decodes to linear light, matching the sRGB swapchain
+		GLenum const format = (m_format == GL_SRGB8_ALPHA8) ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+		glTexImage2D(GL_TEXTURE_2D, 0, format, m_front->width, m_front->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, m_front->pixels.data());
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		m_source_width = m_front->width;
+		m_source_height = m_front->height;
+	}
+	else
+	{
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_front->width, m_front->height, GL_RGBA, GL_UNSIGNED_BYTE, m_front->pixels.data());
+	}
+	glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void quest_xr::draw_screen()
 {
 	uint32_t index = 0;
 	XrSwapchainImageAcquireInfo acquire{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -711,15 +931,67 @@ void quest_xr::upload_frame()
 	wait.timeout = XR_INFINITE_DURATION;
 	xrWaitSwapchainImage(m_swapchain, &wait);
 
-	glBindTexture(GL_TEXTURE_2D, m_sc_images[index].image);
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_front->width, m_front->height, GL_RGBA, GL_UNSIGNED_BYTE, m_front->pixels.data());
+	int mode = MODE_SMOOTH;
+	float scanlines = 0.0f;
+	if (m_front->native)
+	{
+		mode = m_crt ? MODE_CRT : MODE_PIXELS;
+
+		// fade scanlines out where the display can't resolve them, rather
+		// than let them alias into moire
+		float const aspect = m_front->aspect;
+		float const across = m_front->vertical ? aspect : 1.0f;   // physical size across the scanlines
+		int const lines = m_front->vertical ? m_front->width : m_front->height;
+		float const per_line = float(m_screen_pixels.load()) * across / std::max(aspect, 1.0f) / float(lines);
+		scanlines = std::clamp((per_line - 1.5f) / 1.5f, 0.0f, 1.0f);
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_sc_images[index].image, 0);
+	glViewport(0, 0, m_sc_width, m_sc_height);
+	glUseProgram(m_program);
+	glUniform2f(m_u_source_size, float(m_source_width), float(m_source_height));
+	glUniform2f(m_u_output_size, float(m_sc_width), float(m_sc_height));
+	glUniform1i(m_u_mode, mode);
+	glUniform1i(m_u_vertical, m_front->vertical ? 1 : 0);
+	glUniform1f(m_u_scanlines, scanlines);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, m_source);
+	glBindVertexArray(m_vao);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glBindVertexArray(0);
 	glBindTexture(GL_TEXTURE_2D, 0);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glFlush();
 
 	XrSwapchainImageReleaseInfo release{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 	xrReleaseSwapchainImage(m_swapchain, &release);
 	m_sc_has_content = true;
+}
+
+void quest_xr::load_settings()
+{
+	if (m_files_dir.empty())
+		return;
+	std::FILE *const file = std::fopen((m_files_dir + "/quest_settings.txt").c_str(), "r");
+	if (!file)
+		return;
+	int crt = 1;
+	if (std::fscanf(file, "crt %d", &crt) == 1)
+		m_crt = crt != 0;
+	std::fclose(file);
+}
+
+void quest_xr::save_settings() const
+{
+	if (m_files_dir.empty())
+		return;
+	std::FILE *const file = std::fopen((m_files_dir + "/quest_settings.txt").c_str(), "w");
+	if (!file)
+		return;
+	std::fprintf(file, "crt %d\n", m_crt ? 1 : 0);
+	std::fclose(file);
 }
 
 void quest_xr::poll_events()
@@ -847,12 +1119,28 @@ void quest_xr::sync_input()
 	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_GUIDE, (now < m_guide_until) ? SDL_PRESSED : SDL_RELEASED);
 	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_MISC1, (now < m_cancel_until) ? SDL_PRESSED : SDL_RELEASED);
 
-	// the hand holding the screen uses its stick to adjust it instead
+	// the hand holding the screen uses its stick to adjust it and its
+	// trigger to switch the CRT look, instead of passing them to MAME
 	XrVector2f sticks[2] = { get_vector(m_stick[0]), get_vector(m_stick[1]) };
+	float triggers[2] = { get_float(m_trigger[0]), get_float(m_trigger[1]) };
 	if (m_grab_hand >= 0)
 	{
 		m_grab_stick = sticks[m_grab_hand];
 		sticks[m_grab_hand] = { 0.0f, 0.0f };
+		bool const down = triggers[m_grab_hand] > GRAB_THRESHOLD;
+		if (down && !m_trigger_was_down)
+		{
+			m_crt = !m_crt;
+			m_redraw = true;
+			save_settings();
+			XRLOG("CRT look %s", m_crt ? "on" : "off");
+		}
+		m_trigger_was_down = down;
+		triggers[m_grab_hand] = 0.0f;
+	}
+	else
+	{
+		m_trigger_was_down = false;
 	}
 
 	// right stick is primary; OpenXR stick Y is up-positive, SDL's is down-positive
@@ -862,8 +1150,8 @@ void quest_xr::sync_input()
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTY, to_axis(-primary.y));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTX, to_axis(secondary.x));
 	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTY, to_axis(-secondary.y));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, to_axis(get_float(m_trigger[0])));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, to_axis(get_float(m_trigger[1])));
+	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, to_axis(triggers[0]));
+	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, to_axis(triggers[1]));
 }
 
 void quest_xr::update_placement(XrTime time, XrDuration period)
@@ -943,7 +1231,7 @@ void quest_xr::update_screen_pixels(XrTime time)
 	if (XR_FAILED(xrLocateSpace(m_view_space, m_space, time, &head)) || !(head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
 		return;
 	float const distance = std::max(length(m_screen_pose.position - head.pose.position), 0.1f);
-	float const aspect = (m_sc_width > 0 && m_sc_height > 0) ? float(m_sc_width) / float(m_sc_height) : 4.0f / 3.0f;
+	float const aspect = (m_front->width > 0) ? m_front->aspect : 4.0f / 3.0f;
 	float const edge = m_screen_height * std::max(aspect, 1.0f);
 	float const degrees = 2.0f * std::atan(0.5f * edge / distance) * (180.0f / 3.14159265f);
 	m_screen_pixels = int(degrees * PIXELS_PER_DEGREE);
@@ -1006,16 +1294,22 @@ void quest_xr::render_frame()
 		settings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB;
 		quad.next = &settings;
 	}
-	if (frame_state.shouldRender && m_front->width > 0 && m_front->height > 0 && ensure_swapchain(m_front->width, m_front->height))
+	int sc_width = 0, sc_height = 0;
+	if (m_front->width > 0 && m_front->height > 0)
+		choose_swapchain_size(sc_width, sc_height);
+	if (frame_state.shouldRender && sc_width > 0 && ensure_swapchain(sc_width, sc_height))
 	{
-		if (m_front_fresh || !m_sc_has_content)
-		{
+		if (m_front_fresh)
 			upload_frame();
+		if (m_front_fresh || m_redraw || !m_sc_has_content)
+		{
+			draw_screen();
 			m_front_fresh = false;
+			m_redraw = false;
 		}
 		if (m_sc_has_content)
 		{
-			float const aspect = float(m_sc_width) / float(m_sc_height);
+			float const aspect = m_front->aspect;
 			quad.space = m_space;
 			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 			quad.subImage.swapchain = m_swapchain;
@@ -1037,6 +1331,15 @@ void quest_xr::render_frame()
 void quest_xr::shutdown()
 {
 	destroy_swapchain();
+	if (m_program)
+		glDeleteProgram(m_program);
+	if (m_vao)
+		glDeleteVertexArrays(1, &m_vao);
+	if (m_fbo)
+		glDeleteFramebuffers(1, &m_fbo);
+	if (m_source)
+		glDeleteTextures(1, &m_source);
+	m_program = m_vao = m_fbo = m_source = 0;
 	m_anchor.shutdown();
 	if (m_passthrough_layer != XR_NULL_HANDLE && m_xrDestroyPassthroughLayerFB)
 		m_xrDestroyPassthroughLayerFB(m_passthrough_layer);
@@ -1091,9 +1394,9 @@ uint32_t *xr_begin_frame(int width, int height)
 	return s_xr.begin_frame(width, height);
 }
 
-void xr_end_frame()
+void xr_end_frame(float aspect, bool native, bool vertical)
 {
-	s_xr.end_frame();
+	s_xr.end_frame(aspect, native, vertical);
 }
 
 int xr_screen_pixels()
