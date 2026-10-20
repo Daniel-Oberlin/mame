@@ -153,21 +153,22 @@ vec3 pixels(vec2 uv)
 	return texture(u_source, (floor(texel) + offset) / u_source_size).rgb;
 }
 
-// one sample on a scanline; along the line the beam blurs a little
+// one sample on a scanline; along the line, neighbouring pixels blend only
+// over the outer eighth of each pixel, a slight softening of their edges
 vec3 beam_sample(float along, float line, vec2 size)
 {
-	float cell = floor(along);
-	float soft = cell + 0.5 + clamp((fract(along) - 0.5) * 1.5, -0.5, 0.5);
+	float centre = fract(along) - 0.5;
+	float soft = floor(along) + 0.5 + (centre - clamp(centre, -0.375, 0.375)) * 4.0;
 	vec2 at = vec2(soft, line + 0.5);
 	if (u_vertical)
 		at = at.yx;
 	return texture(u_source, at / u_source_size).rgb;
 }
 
-// brighter lines are drawn by a wider beam
+// brighter lines are drawn by a wider beam, just reaching the next line
 vec3 beam_weight(float distance, vec3 colour)
 {
-	vec3 width = mix(vec3(0.22), vec3(0.42), sqrt(colour));
+	vec3 width = mix(vec3(0.18), vec3(0.30), sqrt(colour));
 	return exp(-0.5 * distance * distance / (width * width));
 }
 
@@ -181,7 +182,7 @@ vec3 crt(vec2 uv)
 	vec3 near = beam_sample(p.x, line, size);
 	vec3 far = beam_sample(p.x, neighbour, size);
 	vec3 colour = near * beam_weight(abs(offset), near) + far * beam_weight(1.0 - abs(offset), far);
-	return mix(pixels(uv), min(colour * 1.2, vec3(1.0)), u_scanlines);
+	return mix(pixels(uv), min(colour * 1.4, vec3(1.0)), u_scanlines);
 }
 
 void main()
@@ -319,6 +320,7 @@ private:
 	GLint m_u_vertical = -1;
 	GLint m_u_scanlines = -1;
 	bool m_crt = true;
+	int m_native_edge = 0;   // longest edge of the latest native frame
 	bool m_redraw = false;
 	bool m_trigger_was_down = false;
 
@@ -864,12 +866,11 @@ void quest_xr::choose_swapchain_size(int &width, int &height) const
 {
 	// as many pixels as the screen covers on the display, and enough per
 	// scanline for the CRT look to resolve them
+	// (sized for the game's native frames even while a menu shows scaled
+	// ones, so opening the menu doesn't recreate the swapchain)
 	int edge = std::clamp(m_screen_pixels.load(), MIN_SWAPCHAIN_EDGE, MAX_SWAPCHAIN_EDGE);
-	if (m_front->native && m_crt)
-	{
-		int const lines = std::max(m_front->width, m_front->height);
-		edge = std::clamp(std::max(edge, lines * CRT_PIXELS_PER_LINE), MIN_SWAPCHAIN_EDGE, MAX_SWAPCHAIN_EDGE);
-	}
+	if (m_crt && m_native_edge)
+		edge = std::clamp(std::max(edge, m_native_edge * CRT_PIXELS_PER_LINE), MIN_SWAPCHAIN_EDGE, MAX_SWAPCHAIN_EDGE);
 	float const aspect = m_front->aspect;
 	if (aspect >= 1.0f)
 	{
@@ -900,6 +901,8 @@ void quest_xr::choose_swapchain_size(int &width, int &height) const
 
 void quest_xr::upload_frame()
 {
+	if (m_front->native)
+		m_native_edge = std::max(m_front->width, m_front->height);
 	glBindTexture(GL_TEXTURE_2D, m_source);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 	if (m_front->width != m_source_width || m_front->height != m_source_height)
