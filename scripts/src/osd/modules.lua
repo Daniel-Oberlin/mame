@@ -163,6 +163,8 @@ function osdmodulesbuild()
 			MAME_DIR .. "src/osd/modules/render/drawquest.cpp",
 			MAME_DIR .. "src/osd/quest/questxr.cpp",
 			MAME_DIR .. "src/osd/quest/questxr.h",
+			MAME_DIR .. "src/osd/quest/questanchor.cpp",
+			MAME_DIR .. "src/osd/quest/questanchor.h",
 		}
 		includedirs {
 			MAME_DIR .. "src/osd/quest",

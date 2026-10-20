@@ -12,6 +12,7 @@
 //============================================================
 
 #include "questxr.h"
+#include "questanchor.h"
 
 #include <SDL2/SDL.h>
 
@@ -65,6 +66,11 @@ constexpr float ADJUST_RATE = 1.0f; // e-folds per second at full deflection
 constexpr float GRAB_THRESHOLD = 0.5f;
 constexpr float RELEASE_THRESHOLD = 0.3f;
 
+// the menu button opens MAME's menu when tapped and exits (the game, or MAME
+// from the system list) when held
+constexpr auto MENU_HOLD_TIME = std::chrono::milliseconds(800);
+constexpr auto BUTTON_PULSE_TIME = std::chrono::milliseconds(100);
+
 struct button_binding
 {
 	char const *action;
@@ -75,13 +81,13 @@ struct button_binding
 // Touch controller -> standard gamepad layout, right hand leading: the right
 // stick drives the gamepad's primary (left) stick. MAME's game controller
 // support maps A/B to buttons 1-2 (and menu select/back), Back to coin, Start
-// to start and Guide to its menu.
+// to start and Guide to its menu. The menu button is handled separately so it
+// can tell a tap from a hold.
 button_binding const BUTTONS[] = {
 	{ "a",     "/user/hand/right/input/a/click",   SDL_CONTROLLER_BUTTON_A },
 	{ "b",     "/user/hand/right/input/b/click",   SDL_CONTROLLER_BUTTON_B },
 	{ "coin",  "/user/hand/left/input/x/click",    SDL_CONTROLLER_BUTTON_BACK },
 	{ "start", "/user/hand/left/input/y/click",    SDL_CONTROLLER_BUTTON_START },
-	{ "guide", "/user/hand/left/input/menu/click", SDL_CONTROLLER_BUTTON_GUIDE },
 	{ "l1",    "/user/hand/left/input/thumbstick/click",  SDL_CONTROLLER_BUTTON_LEFTSHOULDER },
 	{ "r1",    "/user/hand/right/input/thumbstick/click", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
 };
@@ -214,7 +220,21 @@ private:
 	XrAction m_aim[2] = { };
 	XrSpace m_aim_space[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 	XrSpace m_view_space = XR_NULL_HANDLE;
+	XrAction m_menu = XR_NULL_HANDLE;
 	uint32_t m_pressed = 0;
+
+	using clock = std::chrono::steady_clock;
+	bool m_menu_down = false;
+	bool m_menu_held = false;
+	clock::time_point m_menu_since;
+	clock::time_point m_guide_until;   // tap: pulse Guide (MAME menu)
+	clock::time_point m_cancel_until;  // hold: pulse Misc1 (MAME UI cancel)
+
+	std::string m_files_dir;
+	bool m_has_anchor_ext = false;
+	bool m_anchor_ok = false;
+	bool m_reanchor = false;
+	screen_anchor m_anchor;
 
 	// screen placement in m_space; only the XR thread touches these
 	XrPosef m_screen_pose{ { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -SCREEN_DISTANCE } };
@@ -244,6 +264,8 @@ bool quest_xr::start()
 		return false;
 	}
 	env->GetJavaVM(&m_vm);
+	if (char const *const dir = SDL_AndroidGetExternalStoragePath())
+		m_files_dir = dir;
 	m_activity = env->NewGlobalRef(activity);
 	env->DeleteLocalRef(activity);
 
@@ -323,7 +345,9 @@ void quest_xr::run()
 	if (init_egl() && init_instance() && init_session() && init_actions())
 	{
 		init_passthrough();
-		XRLOG("OpenXR ready");
+		if (m_has_anchor_ext && !m_files_dir.empty())
+			m_anchor_ok = m_anchor.init(m_instance, m_session, m_files_dir + "/screen_anchor.txt", m_screen_height);
+		XRLOG("OpenXR ready%s", m_anchor_ok ? "" : " (screen placement won't be saved)");
 		while (!m_exit)
 		{
 			poll_events();
@@ -397,17 +421,21 @@ bool quest_xr::init_instance()
 	xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr);
 	std::vector<XrExtensionProperties> available(ext_count, { XR_TYPE_EXTENSION_PROPERTIES });
 	xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, available.data());
-	for (auto const &ext : available)
+	auto const has_extension = [&available] (char const *name)
 	{
-		if (!std::strcmp(ext.extensionName, XR_FB_PASSTHROUGH_EXTENSION_NAME))
-			m_has_passthrough_ext = true;
-	}
+		return std::any_of(available.begin(), available.end(), [name] (auto const &ext) { return !std::strcmp(ext.extensionName, name); });
+	};
+	m_has_passthrough_ext = has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+	auto const &anchor_extensions = screen_anchor::extensions();
+	m_has_anchor_ext = std::all_of(anchor_extensions.begin(), anchor_extensions.end(), has_extension);
 
 	std::vector<char const *> extensions = {
 			XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 			XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
 	if (m_has_passthrough_ext)
 		extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+	if (m_has_anchor_ext)
+		extensions.insert(extensions.end(), anchor_extensions.begin(), anchor_extensions.end());
 
 	XrInstanceCreateInfoAndroidKHR android_info{ XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 	android_info.applicationVM = m_vm;
@@ -509,6 +537,9 @@ bool quest_xr::init_actions()
 		m_buttons[i] = create_action(BUTTONS[i].action, XR_ACTION_TYPE_BOOLEAN_INPUT);
 		suggest(bindings, m_buttons[i], BUTTONS[i].path);
 	}
+
+	m_menu = create_action("menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
+	suggest(bindings, m_menu, "/user/hand/left/input/menu/click");
 
 	char const *const hands[2] = { "left", "right" };
 	for (int hand = 0; hand < 2; ++hand)
@@ -691,6 +722,8 @@ void quest_xr::poll_events()
 				reset_placement();
 			break;
 		default:
+			if (m_anchor_ok)
+				m_anchor.handle_event(event);
 			break;
 		}
 		event = { XR_TYPE_EVENT_DATA_BUFFER };
@@ -749,6 +782,26 @@ void quest_xr::sync_input()
 		m_pressed = pressed;
 	}
 
+	auto const now = clock::now();
+	bool const menu = get_bool(m_menu);
+	if (menu && !m_menu_down)
+	{
+		m_menu_since = now;
+		m_menu_held = false;
+	}
+	else if (menu && !m_menu_held && (now - m_menu_since) >= MENU_HOLD_TIME)
+	{
+		m_menu_held = true;
+		m_cancel_until = now + BUTTON_PULSE_TIME;
+	}
+	else if (!menu && m_menu_down && !m_menu_held)
+	{
+		m_guide_until = now + BUTTON_PULSE_TIME;
+	}
+	m_menu_down = menu;
+	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_GUIDE, (now < m_guide_until) ? SDL_PRESSED : SDL_RELEASED);
+	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_MISC1, (now < m_cancel_until) ? SDL_PRESSED : SDL_RELEASED);
+
 	// the hand holding the screen uses its stick to adjust it instead
 	XrVector2f sticks[2] = { get_vector(m_stick[0]), get_vector(m_stick[1]) };
 	if (m_grab_hand >= 0)
@@ -775,6 +828,8 @@ void quest_xr::update_placement(XrTime time, XrDuration period)
 		XrVector3f const &p = m_screen_pose.position;
 		XRLOG("Screen placed at (%.2f, %.2f, %.2f), height %.2f m", p.x, p.y, p.z, m_screen_height);
 		m_grab_hand = -1;
+		if (m_anchor_ok)
+			m_anchor.place(m_space, m_screen_pose, time, m_screen_height);
 	}
 
 	XrSpaceLocation hand{ XR_TYPE_SPACE_LOCATION };
@@ -786,6 +841,17 @@ void quest_xr::update_placement(XrTime time, XrDuration period)
 
 	if (m_grab_hand < 0)
 	{
+		if (m_reanchor)
+		{
+			m_reanchor = false;
+			m_anchor.place(m_space, m_screen_pose, time, m_screen_height);
+		}
+		else
+		{
+			// follow the anchor so the screen stays put in the room
+			m_anchor.locate(m_space, time, m_screen_pose);
+		}
+
 		for (int which = 1; which >= 0; --which)
 		{
 			if (get_float(m_grip[which]) > GRAB_THRESHOLD && located(which))
@@ -829,6 +895,7 @@ void quest_xr::reset_placement()
 	m_screen_pose = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -SCREEN_DISTANCE } };
 	m_screen_height = SCREEN_HEIGHT;
 	m_grab_hand = -1;
+	m_reanchor = m_anchor_ok;
 }
 
 void quest_xr::render_frame()
@@ -896,6 +963,7 @@ void quest_xr::render_frame()
 void quest_xr::shutdown()
 {
 	destroy_swapchain();
+	m_anchor.shutdown();
 	if (m_passthrough_layer != XR_NULL_HANDLE && m_xrDestroyPassthroughLayerFB)
 		m_xrDestroyPassthroughLayerFB(m_passthrough_layer);
 	if (m_passthrough != XR_NULL_HANDLE && m_xrDestroyPassthroughFB)

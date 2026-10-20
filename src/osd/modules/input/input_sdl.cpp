@@ -1613,6 +1613,11 @@ public:
 		add_button_assignment(assignments, IPT_SELECT,  { buttonitems[SDL_CONTROLLER_BUTTON_BACK] });
 		add_button_assignment(assignments, IPT_START,   { buttonitems[SDL_CONTROLLER_BUTTON_START] });
 		add_button_assignment(assignments, IPT_UI_MENU, { buttonitems[SDL_CONTROLLER_BUTTON_GUIDE] });
+#if defined(SDLMAME_ANDROID)
+		// the Quest controller bridge sends Misc1 when the menu button is held;
+		// there may be no keyboard to press Escape on
+		add_button_assignment(assignments, IPT_UI_CANCEL, { buttonitems[SDL_CONTROLLER_BUTTON_MISC1] });
+#endif
 
 		// the first button is always UI select
 		if (add_button_assignment(assignments, IPT_UI_SELECT, { std::get<0>(numberedbuttons[0]) }))
