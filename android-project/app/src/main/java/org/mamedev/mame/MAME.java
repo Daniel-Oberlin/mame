@@ -22,6 +22,8 @@ public class MAME extends SDLActivity {
 		super.onCreate(savedInstanceState);
 		copyAssetAll("bgfx");
 		copyAssetAll("language");
+		copyAssetAll("plugins", true);
+		copyAssetAll("plugin.ini");
     }
 
 	@Override
@@ -32,19 +34,24 @@ public class MAME extends SDLActivity {
 	}
 
 	public void copyAssetAll(String srcPath) {
+		copyAssetAll(srcPath, false);
+	}
+
+	// replace = true refreshes files that ship with the app, so updates reach the headset
+	public void copyAssetAll(String srcPath, boolean replace) {
 		AssetManager assetMgr = this.getAssets();
 		String assets[] = null;
 		try {
 			String destPath = getExternalFilesDir(null) + File.separator + srcPath;
 			assets = assetMgr.list(srcPath);
 			if (assets.length == 0) {
-				copyFile(srcPath, destPath);
+				copyFile(srcPath, destPath, replace);
 			} else {
 				File dir = new File(destPath);
 				if (!dir.exists())
 					dir.mkdir();
 				for (String element : assets) {
-					copyAssetAll(srcPath + File.separator + element);
+					copyAssetAll(srcPath + File.separator + element, replace);
 				}
 			}
 		}
@@ -52,14 +59,14 @@ public class MAME extends SDLActivity {
 		   e.printStackTrace();
 		}
 	}
-	public void copyFile(String srcFile, String destFile) {
+	public void copyFile(String srcFile, String destFile, boolean replace) {
 		AssetManager assetMgr = this.getAssets();
 
 		InputStream is = null;
 		OutputStream os = null;
 		try {
 			is = assetMgr.open(srcFile);
-			if (new File(destFile).exists() == false)
+			if (replace || new File(destFile).exists() == false)
 			{
 				os = new FileOutputStream(destFile);
 
