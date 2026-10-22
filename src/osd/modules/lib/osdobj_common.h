@@ -299,7 +299,7 @@ private:
 	font_module *m_font_module;
 
 	void update_option(const std::string &key, std::vector<std::string_view> const &values);
-	void choose_control_sharing();
+	void network_machine_reset();
 	// FIXME: should be elsewhere
 	template<class C>
 	C &select_module_options(const std::string &opt_name)

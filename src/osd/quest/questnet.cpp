@@ -31,7 +31,9 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 
@@ -58,6 +60,9 @@ void merge(pad_state &into, pad_state const &from)
 		if (std::abs(from.axes[axis]) > std::abs(into.axes[axis]))
 			into.axes[axis] = from.axes[axis];
 }
+
+std::mutex s_notice_mutex;
+std::vector<std::string> s_notices;
 
 void set_pad(SDL_Joystick *pad, pad_state const &state)
 {
@@ -177,6 +182,7 @@ public:
 
 	void post_frame(std::shared_ptr<shared_frame const> const &frame);
 	void post_audio(int16_t const *samples, int frames, int channels, int rate);
+	void post_game(std::string const &name);
 
 	// newest controller packet seen, so late arrivals are ignored
 	uint32_t m_input_sequence = 0;
@@ -197,6 +203,8 @@ private:
 	std::shared_ptr<shared_frame const> m_frame;       // latest not yet sent; older ones are skipped
 	std::deque<std::vector<uint8_t>> m_audio;          // audio_message + samples, ready to send
 	size_t m_audio_bytes = 0;
+	std::string m_game;                                // name not yet sent
+	bool m_game_pending = false;
 
 	// sender thread only
 	std::vector<uint32_t> m_sent;     // last frame sent, which the guest XORs against
@@ -259,25 +267,40 @@ void guest_link::post_audio(int16_t const *samples, int frames, int channels, in
 	m_wake.notify_one();
 }
 
+void guest_link::post_game(std::string const &name)
+{
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_game = name;
+		m_game_pending = true;
+	}
+	m_wake.notify_one();
+}
+
 void guest_link::run()
 {
 	while (true)
 	{
 		std::shared_ptr<shared_frame const> frame;
 		std::deque<std::vector<uint8_t>> audio;
+		std::string game;
+		bool send_game;
 		{
 			std::unique_lock<std::mutex> lock(m_mutex);
-			m_wake.wait(lock, [this] () { return !m_alive || m_frame || !m_audio.empty(); });
+			m_wake.wait(lock, [this] () { return !m_alive || m_frame || !m_audio.empty() || m_game_pending; });
 			if (!m_alive)
 				return;
 			frame = std::move(m_frame);
 			m_frame.reset();
 			audio.swap(m_audio);
 			m_audio_bytes = 0;
+			game.swap(m_game);
+			send_game = m_game_pending;
+			m_game_pending = false;
 		}
 
 		// sound first: it's small, and a gap is more noticeable than a late frame
-		bool ok = true;
+		bool ok = !send_game || send_message(m_socket, message::GAME, game.data(), game.size());
 		for (auto const &packet : audio)
 			ok = ok && send_message(m_socket, message::AUDIO, packet.data(), packet.size());
 		if (ok && frame)
@@ -285,6 +308,7 @@ void guest_link::run()
 		if (!ok)
 		{
 			NETLOG("Player %d (%s) disconnected", m_player, address_string(m_address).c_str());
+			host_notice("Player " + std::to_string(m_player) + " left");
 			m_alive = false;
 			return;
 		}
@@ -336,6 +360,7 @@ public:
 
 	void share_controls(bool share);
 	void merge_shared(pad_state &local);
+	void set_game(std::string const &name);
 
 private:
 	void attach_pads();
@@ -363,6 +388,7 @@ private:
 	std::unique_ptr<guest_link> m_links[MAX_GUESTS];   // by seat, player = seat + 2
 	pad_state m_inputs[MAX_GUESTS];                    // each seat's latest controller state
 	bool m_share = false;
+	std::string m_game;
 	uint32_t m_sequence = 0;
 };
 
@@ -512,7 +538,9 @@ void host::welcome(int socket, sockaddr_in const &address)
 		return;
 	}
 	m_links[seat] = std::make_unique<guest_link>(fd, address, seat + 2);
+	m_links[seat]->post_game(m_game);
 	NETLOG("Player %d joined from %s", seat + 2, address_string(address).c_str());
+	host_notice("Player " + std::to_string(seat + 2) + " joined");
 }
 
 void host::drop_dead_links()
@@ -571,6 +599,15 @@ void host::share_controls(bool share)
 		NETLOG("Guests %s player 1's controls", share ? "share" : "don't share");
 	m_share = share;
 	update_pads();
+}
+
+void host::set_game(std::string const &name)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_game = name;
+	for (auto const &link : m_links)
+		if (link)
+			link->post_game(name);
 }
 
 void host::merge_shared(pad_state &local)
@@ -693,6 +730,7 @@ bool host_start()
 			return false;
 		}
 		s_host = created;
+		host_notice("Hosting: players on this Wi-Fi can join");
 	}
 	return true;
 }
@@ -724,6 +762,24 @@ void host_merge_shared(pad_state &local)
 {
 	if (s_host)
 		s_host->merge_shared(local);
+}
+
+void host_set_game(std::string const &name)
+{
+	if (s_host)
+		s_host->set_game(name);
+}
+
+void host_notice(std::string const &text)
+{
+	std::lock_guard<std::mutex> lock(s_notice_mutex);
+	s_notices.push_back(text);
+}
+
+std::vector<std::string> host_take_notices()
+{
+	std::lock_guard<std::mutex> lock(s_notice_mutex);
+	return std::exchange(s_notices, { });
 }
 
 } // namespace osd::quest::net

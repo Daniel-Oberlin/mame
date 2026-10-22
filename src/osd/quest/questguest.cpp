@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -60,6 +61,9 @@ constexpr double PRESS_SECONDS = 0.2;
 constexpr int SNAPSHOT_INTERVAL = 120;
 constexpr auto STATS_INTERVAL = std::chrono::seconds(5);
 
+// how long a notice such as the game's name stays over the picture
+constexpr auto NOTICE_TIME = std::chrono::seconds(4);
+
 
 // a copy of a frame, for saving to disk
 struct frame_copy
@@ -68,6 +72,111 @@ struct frame_copy
 	int width = 0;
 	int height = 0;
 };
+
+
+//============================================================
+//  notices over the picture
+//============================================================
+
+// 5x7 capitals, digits and the punctuation in game names; a row per byte,
+// leftmost pixel in bit 4
+struct glyph
+{
+	char c;
+	uint8_t rows[7];
+};
+
+glyph const FONT[] = {
+	{ 'A', { 0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 } },
+	{ 'B', { 0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e } },
+	{ 'C', { 0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e } },
+	{ 'D', { 0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e } },
+	{ 'E', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f } },
+	{ 'F', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10 } },
+	{ 'G', { 0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f } },
+	{ 'H', { 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 } },
+	{ 'I', { 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e } },
+	{ 'J', { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c } },
+	{ 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
+	{ 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f } },
+	{ 'M', { 0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11 } },
+	{ 'N', { 0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11 } },
+	{ 'O', { 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
+	{ 'P', { 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10 } },
+	{ 'Q', { 0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d } },
+	{ 'R', { 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11 } },
+	{ 'S', { 0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e } },
+	{ 'T', { 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+	{ 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
+	{ 'V', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04 } },
+	{ 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a } },
+	{ 'X', { 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11 } },
+	{ 'Y', { 0x11, 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04 } },
+	{ 'Z', { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f } },
+	{ '0', { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e } },
+	{ '1', { 0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e } },
+	{ '2', { 0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f } },
+	{ '3', { 0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e } },
+	{ '4', { 0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02 } },
+	{ '5', { 0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e } },
+	{ '6', { 0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e } },
+	{ '7', { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
+	{ '8', { 0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e } },
+	{ '9', { 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c } },
+	{ '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c } },
+	{ ',', { 0x00, 0x00, 0x00, 0x00, 0x0c, 0x04, 0x08 } },
+	{ '-', { 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00 } },
+	{ '(', { 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 } },
+	{ ')', { 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 } },
+	{ '\'', { 0x0c, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00 } },
+	{ ':', { 0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00 } },
+	{ '/', { 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00 } },
+	{ '&', { 0x0c, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0d } },
+	{ '!', { 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04 } },
+	{ '?', { 0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04 } },
+	{ '+', { 0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00 } } };
+
+glyph const *find_glyph(char c)
+{
+	c = char(std::toupper(static_cast<unsigned char>(c)));
+	for (glyph const &g : FONT)
+		if (g.c == c)
+			return &g;
+	return nullptr;    // drawn as a space
+}
+
+// Writes a line of white text on a darkened band across the lower part of
+// the picture, sized to the picture so it reads the same at any resolution.
+void draw_notice(uint32_t *pixels, int width, int height, std::string const &text)
+{
+	int const scale = std::max(1, height / 300);
+	int const cell = 6 * scale;
+	int const pad = 2 * scale;
+	size_t const fits = size_t(std::max(0, (width - 2 * pad) / cell));
+	std::string const shown = text.substr(0, fits);
+	if (shown.empty() || (height < 7 * scale + 2 * pad))
+		return;
+
+	int const band_height = 7 * scale + 2 * pad;
+	int const top = std::min(height * 3 / 4, height - band_height);
+	for (int y = top; y < top + band_height; y++)
+		for (int x = 0; x < width; x++)
+			pixels[size_t(y) * width + x] = (pixels[size_t(y) * width + x] >> 2) & 0x3f3f3f3f;
+
+	int const left = (width - int(shown.size()) * cell + scale) / 2;
+	for (size_t i = 0; i < shown.size(); i++)
+	{
+		glyph const *const g = find_glyph(shown[i]);
+		if (!g)
+			continue;
+		int const x0 = left + int(i) * cell;
+		for (int row = 0; row < 7; row++)
+			for (int col = 0; col < 5; col++)
+				if (g->rows[row] & (0x10 >> col))
+					for (int dy = 0; dy < scale; dy++)
+						std::fill_n(&pixels[size_t(top + pad + row * scale + dy) * width + x0 + col * scale], scale, 0xffffffffU);
+	}
+}
 
 
 //============================================================
@@ -83,8 +192,12 @@ public:
 	int player() const { return m_player; }
 	bool alive() const { return m_alive; }
 
-	// copies the newest frame into the display if one arrived since the last call
-	bool present(frame_display &display, frame_copy *copy);
+	// copies the newest frame into the display if one arrived since the last
+	// call, with the notice, if any, written over it
+	bool present(frame_display &display, std::string const &notice, frame_copy *copy);
+
+	// the game's name when the host says it has changed; empty while choosing
+	bool take_game(std::string &name);
 
 	// moves received sound into an SDL queue, opening the device on first use
 	void play_audio();
@@ -101,6 +214,7 @@ private:
 	void receive();
 	bool receive_frame(uint32_t size);
 	bool receive_audio(uint32_t size);
+	bool receive_game(uint32_t size);
 
 	int m_socket = -1;
 	int m_input = -1;
@@ -127,6 +241,9 @@ private:
 	bool m_fresh = false;
 	int m_frames_received = 0;
 	size_t m_bytes_received = 0;
+
+	std::string m_game;
+	bool m_game_changed = false;
 
 	std::deque<std::vector<int16_t>> m_audio;
 	int m_audio_rate = 0;
@@ -224,6 +341,9 @@ void host_link::receive()
 		case message::AUDIO:
 			ok = receive_audio(header.size);
 			break;
+		case message::GAME:
+			ok = receive_game(header.size);
+			break;
 		default:
 			m_compressed.resize(header.size);
 			ok = receive_all(m_socket, m_compressed.data(), header.size);
@@ -299,7 +419,29 @@ bool host_link::receive_audio(uint32_t size)
 	return true;
 }
 
-bool host_link::present(frame_display &display, frame_copy *copy)
+bool host_link::receive_game(uint32_t size)
+{
+	std::string name(size, '\0');
+	if (!receive_all(m_socket, name.data(), size))
+		return false;
+
+	std::lock_guard<std::mutex> lock(m_mutex);
+	m_game = std::move(name);
+	m_game_changed = true;
+	return true;
+}
+
+bool host_link::take_game(std::string &name)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!m_game_changed)
+		return false;
+	m_game_changed = false;
+	name = m_game;
+	return true;
+}
+
+bool host_link::present(frame_display &display, std::string const &notice, frame_copy *copy)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	if (!m_fresh)
@@ -307,9 +449,11 @@ bool host_link::present(frame_display &display, frame_copy *copy)
 	m_fresh = false;
 	uint32_t *const pixels = display.begin_frame(m_latest_width, m_latest_height);
 	std::copy(m_latest.begin(), m_latest.end(), pixels);
+	if (!notice.empty())
+		draw_notice(pixels, m_latest_width, m_latest_height, notice);
 	if (copy)
 	{
-		copy->pixels = m_latest;
+		copy->pixels.assign(pixels, pixels + m_latest.size());
 		copy->width = m_latest_width;
 		copy->height = m_latest_height;
 	}
@@ -533,7 +677,7 @@ void save_snapshot(std::string const &dir, int number, frame_copy &frame)
 //  public interface
 //============================================================
 
-std::string find_host(std::chrono::milliseconds wait)
+std::string find_host(std::chrono::milliseconds wait, std::string const &ignore)
 {
 	int listener = ::socket(AF_INET, SOCK_DGRAM, 0);
 	int const yes = 1;
@@ -564,7 +708,7 @@ std::string find_host(std::chrono::milliseconds wait)
 		sockaddr_in from{ };
 		socklen_t length = sizeof(from);
 		ssize_t const received = ::recvfrom(listener, &advert, sizeof(advert), 0, reinterpret_cast<sockaddr *>(&from), &length);
-		if ((received == sizeof(advert)) && (advert.magic == MAGIC) && (advert.version == PROTOCOL_VERSION) && advert.free_seats)
+		if ((received == sizeof(advert)) && (advert.magic == MAGIC) && (advert.version == PROTOCOL_VERSION) && advert.free_seats && (address_string(from) != ignore))
 			found = address_string(from);
 	}
 	close_socket(listener);
@@ -609,7 +753,7 @@ int guest_main(guest_options const &options)
 		if (address.empty())
 		{
 			NETERR("No host found");
-			return 1;
+			return GUEST_HOST_GONE;
 		}
 	}
 
@@ -618,7 +762,7 @@ int guest_main(guest_options const &options)
 	if (!link.connect(address, error))
 	{
 		NETERR("Could not join %s: %s", address.c_str(), error.c_str());
-		return 1;
+		return GUEST_HOST_GONE;
 	}
 	NETLOG("Joined %s as player %d", address.c_str(), link.player());
 
@@ -645,6 +789,10 @@ int guest_main(guest_options const &options)
 	int presented = 0;
 	frame_copy snapshot;
 	bool quit = false;
+
+	std::string const player = "Player " + std::to_string(link.player());
+	std::string notice = "Joined as " + player;
+	auto notice_until = start + NOTICE_TIME;
 
 	while (!quit && link.alive())
 	{
@@ -675,8 +823,17 @@ int guest_main(guest_options const &options)
 
 		link.play_audio();
 
+		std::string game;
+		if (link.take_game(game))
+		{
+			notice = player + ": " + (game.empty() ? std::string("host is choosing a game") : game);
+			notice_until = now + NOTICE_TIME;
+		}
+		if (!notice.empty() && (now >= notice_until))
+			notice.clear();
+
 		bool const want_snapshot = !options.snapshot_dir.empty() && ((presented % SNAPSHOT_INTERVAL) == 0);
-		if (link.present(*display, want_snapshot ? &snapshot : nullptr))
+		if (link.present(*display, notice, want_snapshot ? &snapshot : nullptr))
 		{
 			if (want_snapshot)
 				save_snapshot(options.snapshot_dir, presented, snapshot);
@@ -696,14 +853,16 @@ int guest_main(guest_options const &options)
 		SDL_Delay(1);
 	}
 
-	if (!link.alive())
+	bool const host_gone = !link.alive();
+	if (host_gone)
 		NETLOG("The host has gone");
 	display.reset();
 #if !defined(SDLMAME_ANDROID)
 	SDL_DestroyWindow(window);
-#endif
 	SDL_Quit();
-	return 0;
+#endif
+	// on Quest, SDL and the headset stay up in case MAME runs next
+	return host_gone ? GUEST_HOST_GONE : 0;
 }
 
 } // namespace osd::quest::net

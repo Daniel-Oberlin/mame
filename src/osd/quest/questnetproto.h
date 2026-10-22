@@ -48,7 +48,8 @@ enum class message : uint32_t
 	WELCOME,        // host -> guest: welcome_message
 	REFUSED,        // host -> guest: refused_message, then the host hangs up
 	FRAME,          // host -> guest: frame_message + compressed pixels
-	AUDIO           // host -> guest: audio_message + samples
+	AUDIO,          // host -> guest: audio_message + samples
+	GAME            // host -> guest: the game's name in UTF-8, empty while choosing one
 };
 
 enum class refusal : uint32_t

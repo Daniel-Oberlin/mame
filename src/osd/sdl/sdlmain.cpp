@@ -28,6 +28,7 @@
 
 // only for oslog callback
 #include <functional>
+#include <random>
 
 #ifdef SDLMAME_UNIX
 #if (!defined(SDLMAME_MACOSX)) && (!defined(SDLMAME_EMSCRIPTEN)) && (!defined(SDLMAME_ANDROID))
@@ -77,10 +78,23 @@ int main(int argc, char** argv)
 #if defined(SDLMAME_ANDROID)
 	// on Quest, join a nearby host if one is advertising, otherwise host
 	{
-		osd::quest::net::guest_options guest;
-		guest.address = osd::quest::net::find_host(osd::quest::net::HOST_SEARCH_TIME);
-		if (!guest.address.empty())
-			return osd::quest::net::guest_main(guest);
+		namespace net = osd::quest::net;
+		net::guest_options guest;
+		guest.address = net::find_host(net::HOST_SEARCH_TIME);
+		while (!guest.address.empty())
+		{
+			int const result = net::guest_main(guest);
+			if (result != net::GUEST_HOST_GONE)
+				return result;
+
+			// look a little longer for another host, for a random time so that
+			// of the players the host left behind, one hosts and the rest join
+			std::random_device seed;
+			std::uniform_int_distribution<int> extra(0, 2800);
+			guest.address = net::find_host(net::HOST_SEARCH_TIME + std::chrono::milliseconds(extra(seed)), guest.address);
+			if (guest.address.empty())
+				net::host_notice("The host left, so you're hosting now");
+		}
 		args.emplace_back("-" OSDOPTION_HOST);
 	}
 #else

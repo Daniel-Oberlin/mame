@@ -478,6 +478,15 @@ void osd_common_t::init(running_machine &machine)
 
 void osd_common_t::update(bool skip_redraw)
 {
+#if defined(OSD_SDL)
+	// players joining and leaving a shared game
+	std::string notice;
+	for (std::string const &text : osd::quest::net::host_take_notices())
+		notice += (notice.empty() ? "" : "\n") + text;
+	if (!notice.empty())
+		machine().popmessage("%s", notice);
+#endif
+
 	//
 	// This method is called periodically to flush video updates to the
 	// screen, and also to allow the OSD a chance to update other systems
@@ -745,10 +754,14 @@ bool osd_common_t::execute_command(const char *command)
 }
 
 #if defined(OSD_SDL)
-// Games for upright cabinets, where players take turns at one set of
+// Tells guests what's running, and whether they share player 1's controls:
+// games for upright cabinets, where players take turns at one set of
 // controls, only give player 2 controls for their cocktail-table version.
-void osd_common_t::choose_control_sharing()
+void osd_common_t::network_machine_reset()
 {
+	bool const choosing = !strcmp(machine().system().name, "___empty");
+	osd::quest::net::host_set_game(choosing ? "" : machine().system().type.fullname());
+
 	char const *const mode = options().netcontrols();
 	bool share = true;
 	if (!strcmp(mode, "separate"))
@@ -781,7 +794,7 @@ void osd_common_t::init_subsystems()
 	if (options().host())
 	{
 		if (osd::quest::net::host_start())
-			machine().add_notifier(MACHINE_NOTIFY_RESET, machine_notify_delegate(&osd_common_t::choose_control_sharing, this));
+			machine().add_notifier(MACHINE_NOTIFY_RESET, machine_notify_delegate(&osd_common_t::network_machine_reset, this));
 		else
 			osd_printf_error("Could not start hosting network play\n");
 	}

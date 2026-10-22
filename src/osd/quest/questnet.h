@@ -69,14 +69,23 @@ void host_share_controls(bool share);
 // Adds guests' input to the local player's while controls are shared.
 void host_merge_shared(pad_state &local);
 
+// Tells guests which game is running; empty while choosing one.
+void host_set_game(std::string const &name);
+
+// Short messages for the host's player, such as guests joining and leaving.
+// Anything may post one; the host's screen takes them to show.
+void host_notice(std::string const &text);
+std::vector<std::string> host_take_notices();
+
 
 //------------------------------------------------
 //  guest
 //------------------------------------------------
 
 // Address of a host advertising a free seat on the local network, or empty
-// if none is heard within wait.
-std::string find_host(std::chrono::milliseconds wait);
+// if none is heard within wait. A host that has just left may still be
+// heard for a moment; pass its address as ignore.
+std::string find_host(std::chrono::milliseconds wait, std::string const &ignore = std::string());
 
 // long enough to hear a couple of a host's adverts
 constexpr std::chrono::milliseconds HOST_SEARCH_TIME{ 1200 };
@@ -89,8 +98,12 @@ struct guest_options
 	double seconds = 0.0;       // leave after this long; 0 to stay
 };
 
-// Joins a host and plays until the host goes away or the window closes.
-// Returns a process exit code.
+// guest_main's result when there's no host to play with: it stopped,
+// couldn't be joined or wasn't found, rather than the player leaving
+constexpr int GUEST_HOST_GONE = 2;
+
+// Joins a host and plays until the host goes away or the player leaves.
+// Returns a process exit code, or GUEST_HOST_GONE.
 int guest_main(guest_options const &options);
 
 // Recognises "-join [address]" and the guest's testing options in a
