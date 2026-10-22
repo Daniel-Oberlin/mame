@@ -60,6 +60,15 @@ void host_frame(uint32_t const *pixels, int width, int height, float aspect, boo
 // Sends interleaved 16-bit samples to every guest.
 void host_audio(int16_t const *samples, int frames, int channels, int rate);
 
+// With shared controls, guests' sticks and buttons drive player 1's controls
+// too, as players crowd round one upright cabinet and take turns; only coin
+// and start stay their own. Without, each guest has only their own player's
+// controls, for games where everyone plays at once.
+void host_share_controls(bool share);
+
+// Adds guests' input to the local player's while controls are shared.
+void host_merge_shared(pad_state &local);
+
 
 //------------------------------------------------
 //  guest

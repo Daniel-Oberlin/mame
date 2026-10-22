@@ -154,6 +154,7 @@ const options_entry osd_options::s_option_entries[] =
 
 	{ nullptr,                                   nullptr,          core_options::option_type::HEADER,    "OSD NETWORK PLAY OPTIONS" },
 	{ OSDOPTION_HOST,                            "0",              core_options::option_type::BOOLEAN,   "share the game with players on the local network" },
+	{ OSDOPTION_NETCONTROLS,                     OSDOPTVAL_AUTO,   core_options::option_type::STRING,    "whether guests also play with player 1's controls: shared, separate, or auto (shared unless the game gives player 2 controls of their own)" },
 
 	{ nullptr,                                   nullptr,          core_options::option_type::HEADER,    "OSD MIDI OPTIONS" },
 	{ OSDOPTION_MIDI_PROVIDER,                   OSDOPTVAL_AUTO,   core_options::option_type::STRING,    "MIDI I/O method: " },
@@ -743,12 +744,47 @@ bool osd_common_t::execute_command(const char *command)
 
 }
 
+#if defined(OSD_SDL)
+// Games for upright cabinets, where players take turns at one set of
+// controls, only give player 2 controls for their cocktail-table version.
+void osd_common_t::choose_control_sharing()
+{
+	char const *const mode = options().netcontrols();
+	bool share = true;
+	if (!strcmp(mode, "separate"))
+	{
+		share = false;
+	}
+	else if (strcmp(mode, "shared"))
+	{
+		if (strcmp(mode, OSDOPTVAL_AUTO))
+			osd_printf_warning("Unknown netcontrols value %s, using auto\n", mode);
+		for (auto const &port : machine().ioport().ports())
+		{
+			for (ioport_field const &field : port.second->fields())
+			{
+				ioport_type const type = field.type();
+				bool const control = field.is_digital_joystick() || field.is_analog() || ((type >= IPT_BUTTON1) && (type <= IPT_BUTTON16));
+				if (control && (field.player() > 0) && !field.cocktail() && field.enabled())
+					share = false;
+			}
+		}
+	}
+	osd::quest::net::host_share_controls(share);
+}
+#endif
+
 void osd_common_t::init_subsystems()
 {
 #if defined(OSD_SDL)
 	// before input starts, so the guests' gamepads are there to be found
-	if (options().host() && !osd::quest::net::host_start())
-		osd_printf_error("Could not start hosting network play\n");
+	if (options().host())
+	{
+		if (osd::quest::net::host_start())
+			machine().add_notifier(MACHINE_NOTIFY_RESET, machine_notify_delegate(&osd_common_t::choose_control_sharing, this));
+		else
+			osd_printf_error("Could not start hosting network play\n");
+	}
 #endif
 
 	// monitors have to be initialized before video init

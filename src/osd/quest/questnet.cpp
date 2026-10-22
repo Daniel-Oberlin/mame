@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -40,6 +41,35 @@ bool pad_state::operator==(pad_state const &that) const
 {
 	return (buttons == that.buttons) && std::equal(std::begin(axes), std::end(axes), std::begin(that.axes));
 }
+
+namespace {
+
+// guests may not open MAME's menus or quit the host's game
+constexpr uint32_t HOST_ONLY = (1U << SDL_CONTROLLER_BUTTON_GUIDE) | (1U << SDL_CONTROLLER_BUTTON_MISC1);
+
+// coin and start, which stay each player's own when controls are shared
+constexpr uint32_t OWN_BUTTONS = (1U << SDL_CONTROLLER_BUTTON_BACK) | (1U << SDL_CONTROLLER_BUTTON_START);
+
+// buttons held on either, and each axis pushed furthest on either
+void merge(pad_state &into, pad_state const &from)
+{
+	into.buttons |= from.buttons;
+	for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; axis++)
+		if (std::abs(from.axes[axis]) > std::abs(into.axes[axis]))
+			into.axes[axis] = from.axes[axis];
+}
+
+void set_pad(SDL_Joystick *pad, pad_state const &state)
+{
+	if (!pad)
+		return;
+	for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; button++)
+		SDL_JoystickSetVirtualButton(pad, button, ((state.buttons >> button) & 1) ? SDL_PRESSED : SDL_RELEASED);
+	for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; axis++)
+		SDL_JoystickSetVirtualAxis(pad, axis, state.axes[axis]);
+}
+
+} // anonymous namespace
 
 
 //============================================================
@@ -304,6 +334,9 @@ public:
 	void post_frame(uint32_t const *pixels, int width, int height, float aspect, bool native, bool vertical);
 	void post_audio(int16_t const *samples, int frames, int channels, int rate);
 
+	void share_controls(bool share);
+	void merge_shared(pad_state &local);
+
 private:
 	void attach_pads();
 	void accept_guests();
@@ -313,17 +346,23 @@ private:
 	void welcome(int socket, sockaddr_in const &address);
 	void drop_dead_links();
 	void release_pad(int seat);
+	void update_pads();
+	pad_state shared_input();
 	int free_seats();
 
 	int m_listen = -1;
 	int m_input = -1;
 	int m_advert = -1;
 
-	// the gamepad each seat's guest drives, in seat order
+	// the gamepad each seat's guest drives, in seat order, and on desktop
+	// player 1's, which guests drive while controls are shared
 	SDL_Joystick *m_pads[MAX_GUESTS] = { };
+	SDL_Joystick *m_local = nullptr;
 
 	std::mutex m_mutex;
 	std::unique_ptr<guest_link> m_links[MAX_GUESTS];   // by seat, player = seat + 2
+	pad_state m_inputs[MAX_GUESTS];                    // each seat's latest controller state
+	bool m_share = false;
 	uint32_t m_sequence = 0;
 };
 
@@ -400,7 +439,7 @@ void host::attach_pads()
 	};
 
 #if !defined(SDLMAME_ANDROID)
-	attach(LOCAL_NAME);
+	m_local = attach(LOCAL_NAME);
 #endif
 	for (int seat = 0; seat < MAX_GUESTS; seat++)
 		m_pads[seat] = attach((std::string(GUEST_PAD_NAME) + ' ' + std::to_string(seat + 2)).c_str());
@@ -491,13 +530,57 @@ void host::drop_dead_links()
 
 void host::release_pad(int seat)
 {
-	if (SDL_Joystick *const pad = m_pads[seat])
+	// call with m_mutex held
+	m_inputs[seat] = pad_state();
+	update_pads();
+}
+
+void host::update_pads()
+{
+	// call with m_mutex held
+	for (int seat = 0; seat < MAX_GUESTS; seat++)
 	{
-		for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; button++)
-			SDL_JoystickSetVirtualButton(pad, button, SDL_RELEASED);
-		for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; axis++)
-			SDL_JoystickSetVirtualAxis(pad, axis, 0);
+		pad_state own = m_inputs[seat];
+		if (m_share)
+			own = pad_state{ own.buttons & OWN_BUTTONS };
+		set_pad(m_pads[seat], own);
 	}
+	if (m_local)
+		set_pad(m_local, shared_input());
+}
+
+pad_state host::shared_input()
+{
+	// call with m_mutex held
+	pad_state shared;
+	if (m_share)
+	{
+		for (pad_state input : m_inputs)
+		{
+			input.buttons &= ~OWN_BUTTONS;
+			merge(shared, input);
+		}
+	}
+	return shared;
+}
+
+void host::share_controls(bool share)
+{
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (share != m_share)
+		NETLOG("Guests %s player 1's controls", share ? "share" : "don't share");
+	m_share = share;
+	update_pads();
+}
+
+void host::merge_shared(pad_state &local)
+{
+	pad_state shared;
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		shared = shared_input();
+	}
+	merge(local, shared);
 }
 
 int host::free_seats()
@@ -509,9 +592,6 @@ int host::free_seats()
 
 void host::receive_input()
 {
-	// guests may not open MAME's menus or quit the host's game
-	constexpr uint32_t HOST_ONLY = (1U << SDL_CONTROLLER_BUTTON_GUIDE) | (1U << SDL_CONTROLLER_BUTTON_MISC1);
-
 	while (true)
 	{
 		input_packet packet;
@@ -541,11 +621,11 @@ void host::receive_input()
 		link->m_input_seen = true;
 		link->m_input_sequence = packet.sequence;
 
-		uint32_t const buttons = packet.buttons & ~HOST_ONLY;
-		for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; button++)
-			SDL_JoystickSetVirtualButton(pad, button, ((buttons >> button) & 1) ? SDL_PRESSED : SDL_RELEASED);
+		pad_state &input = m_inputs[seat];
+		input.buttons = packet.buttons & ~HOST_ONLY;
 		for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; axis++)
-			SDL_JoystickSetVirtualAxis(pad, axis, packet.axes[axis]);
+			input.axes[axis] = packet.axes[axis];
+		update_pads();
 	}
 }
 
@@ -632,6 +712,18 @@ void host_audio(int16_t const *samples, int frames, int channels, int rate)
 {
 	if (s_host && frames)
 		s_host->post_audio(samples, frames, channels, rate);
+}
+
+void host_share_controls(bool share)
+{
+	if (s_host)
+		s_host->share_controls(share);
+}
+
+void host_merge_shared(pad_state &local)
+{
+	if (s_host)
+		s_host->merge_shared(local);
 }
 
 } // namespace osd::quest::net

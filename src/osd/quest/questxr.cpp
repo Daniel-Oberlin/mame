@@ -14,6 +14,7 @@
 
 #include "questxr.h"
 #include "questanchor.h"
+#include "questnet.h"
 
 #include <SDL2/SDL.h>
 
@@ -1088,13 +1089,15 @@ void quest_xr::sync_input()
 	if (XR_FAILED(xrSyncActions(m_session, &sync)) || !m_pad)
 		return;
 
+	net::pad_state pad;
 	uint32_t pressed = 0;
 	for (size_t i = 0; i < std::size(BUTTONS); ++i)
 	{
-		bool const down = get_bool(m_buttons[i]);
-		SDL_JoystickSetVirtualButton(m_pad, BUTTONS[i].button, down ? SDL_PRESSED : SDL_RELEASED);
-		if (down)
+		if (get_bool(m_buttons[i]))
+		{
+			pad.buttons |= 1U << BUTTONS[i].button;
 			pressed |= 1U << i;
+		}
 	}
 	if (pressed != m_pressed)
 	{
@@ -1119,8 +1122,10 @@ void quest_xr::sync_input()
 		m_guide_until = now + BUTTON_PULSE_TIME;
 	}
 	m_menu_down = menu;
-	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_GUIDE, (now < m_guide_until) ? SDL_PRESSED : SDL_RELEASED);
-	SDL_JoystickSetVirtualButton(m_pad, SDL_CONTROLLER_BUTTON_MISC1, (now < m_cancel_until) ? SDL_PRESSED : SDL_RELEASED);
+	if (now < m_guide_until)
+		pad.buttons |= 1U << SDL_CONTROLLER_BUTTON_GUIDE;
+	if (now < m_cancel_until)
+		pad.buttons |= 1U << SDL_CONTROLLER_BUTTON_MISC1;
 
 	// the hand holding the screen uses its stick to adjust it and its
 	// trigger to switch the CRT look, instead of passing them to MAME
@@ -1149,12 +1154,20 @@ void quest_xr::sync_input()
 	// right stick is primary; OpenXR stick Y is up-positive, SDL's is down-positive
 	XrVector2f const primary = sticks[1];
 	XrVector2f const secondary = sticks[0];
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTX, to_axis(primary.x));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_LEFTY, to_axis(-primary.y));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTX, to_axis(secondary.x));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_RIGHTY, to_axis(-secondary.y));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, to_axis(triggers[0]));
-	SDL_JoystickSetVirtualAxis(m_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, to_axis(triggers[1]));
+	pad.axes[SDL_CONTROLLER_AXIS_LEFTX] = to_axis(primary.x);
+	pad.axes[SDL_CONTROLLER_AXIS_LEFTY] = to_axis(-primary.y);
+	pad.axes[SDL_CONTROLLER_AXIS_RIGHTX] = to_axis(secondary.x);
+	pad.axes[SDL_CONTROLLER_AXIS_RIGHTY] = to_axis(-secondary.y);
+	pad.axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT] = to_axis(triggers[0]);
+	pad.axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = to_axis(triggers[1]);
+
+	// when hosting a game where players take turns, guests play with these too
+	net::host_merge_shared(pad);
+
+	for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; button++)
+		SDL_JoystickSetVirtualButton(m_pad, button, ((pad.buttons >> button) & 1) ? SDL_PRESSED : SDL_RELEASED);
+	for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; axis++)
+		SDL_JoystickSetVirtualAxis(m_pad, axis, pad.axes[axis]);
 }
 
 void quest_xr::update_placement(XrTime time, XrDuration period)

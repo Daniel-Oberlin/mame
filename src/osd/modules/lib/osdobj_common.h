@@ -53,6 +53,7 @@
 
 #define OSDOPTION_VIDEO                 "video"
 #define OSDOPTION_HOST                  "host"
+#define OSDOPTION_NETCONTROLS           "netcontrols"
 #define OSDOPTION_NUMSCREENS            "numscreens"
 #define OSDOPTION_WINDOW                "window"
 #define OSDOPTION_MAXIMIZE              "maximize"
@@ -125,6 +126,7 @@ public:
 
 	// network play options
 	bool host() const { return bool_value(OSDOPTION_HOST); }
+	const char *netcontrols() const { return value(OSDOPTION_NETCONTROLS); }
 
 	// video options
 	const char *video() const { return value(OSDOPTION_VIDEO); }
@@ -297,6 +299,7 @@ private:
 	font_module *m_font_module;
 
 	void update_option(const std::string &key, std::vector<std::string_view> const &values);
+	void choose_control_sharing();
 	// FIXME: should be elsewhere
 	template<class C>
 	C &select_module_options(const std::string &opt_name)

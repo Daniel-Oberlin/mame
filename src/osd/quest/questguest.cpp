@@ -439,19 +439,36 @@ public:
 	pad_state read(double seconds);
 
 private:
+	void open_controller();
+
 	SDL_GameController *m_controller = nullptr;
 	std::vector<scripted_press> const m_presses;
 };
 
+// Opens the first game controller, preferring the Touch controllers' pad
+// on Quest. That pad can be attached before we start listening for
+// devices, so look rather than wait for an event.
+void input_reader::open_controller()
+{
+	int chosen = -1;
+	for (int index = 0; index < SDL_NumJoysticks(); index++)
+	{
+		if (!SDL_IsGameController(index))
+			continue;
+		char const *const name = SDL_GameControllerNameForIndex(index);
+		if ((chosen < 0) || (name && !std::strcmp(name, "Quest Touch Controllers")))
+			chosen = index;
+	}
+	if (chosen < 0)
+		return;
+	m_controller = SDL_GameControllerOpen(chosen);
+	if (m_controller)
+		NETLOG("Using controller %s", SDL_GameControllerName(m_controller));
+}
+
 void input_reader::handle_event(SDL_Event const &event)
 {
-	if ((event.type == SDL_CONTROLLERDEVICEADDED) && !m_controller)
-	{
-		m_controller = SDL_GameControllerOpen(event.cdevice.which);
-		if (m_controller)
-			NETLOG("Using controller %s", SDL_GameControllerName(m_controller));
-	}
-	else if ((event.type == SDL_CONTROLLERDEVICEREMOVED) && m_controller && (event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(m_controller))))
+	if ((event.type == SDL_CONTROLLERDEVICEREMOVED) && m_controller && (event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(m_controller))))
 	{
 		SDL_GameControllerClose(m_controller);
 		m_controller = nullptr;
@@ -461,6 +478,8 @@ void input_reader::handle_event(SDL_Event const &event)
 pad_state input_reader::read(double seconds)
 {
 	pad_state state;
+	if (!m_controller)
+		open_controller();
 	if (m_controller)
 	{
 		for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; button++)
