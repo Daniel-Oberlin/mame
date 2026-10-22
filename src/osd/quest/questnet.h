@@ -69,6 +69,9 @@ void host_audio(int16_t const *samples, int frames, int channels, int rate);
 // if none is heard within wait.
 std::string find_host(std::chrono::milliseconds wait);
 
+// long enough to hear a couple of a host's adverts
+constexpr std::chrono::milliseconds HOST_SEARCH_TIME{ 1200 };
+
 struct guest_options
 {
 	std::string address;        // host to join; empty to look for one

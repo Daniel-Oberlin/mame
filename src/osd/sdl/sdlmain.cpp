@@ -74,7 +74,16 @@ int main(int argc, char** argv)
 	std::vector<std::string> args = osd_get_command_line(argc, argv);
 	int res = 0;
 
-#if !defined(SDLMAME_ANDROID)
+#if defined(SDLMAME_ANDROID)
+	// on Quest, join a nearby host if one is advertising, otherwise host
+	{
+		osd::quest::net::guest_options guest;
+		guest.address = osd::quest::net::find_host(osd::quest::net::HOST_SEARCH_TIME);
+		if (!guest.address.empty())
+			return osd::quest::net::guest_main(guest);
+		args.emplace_back("-" OSDOPTION_HOST);
+	}
+#else
 	// -join runs a network guest instead of MAME
 	{
 		osd::quest::net::guest_options guest;

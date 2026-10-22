@@ -632,7 +632,7 @@ int guest_main(guest_options const &options)
 		SDL_Event event;
 		while (SDL_PollEvent(&event))
 		{
-			if (event.type == SDL_QUIT)
+			if ((event.type == SDL_QUIT) || ((event.type == SDL_KEYDOWN) && (event.key.keysym.sym == SDLK_ESCAPE)))
 				quit = true;
 			input.handle_event(event);
 		}
@@ -643,6 +643,10 @@ int guest_main(guest_options const &options)
 			break;
 
 		pad_state const state = input.read(seconds);
+
+		// holding the Quest's menu button leaves, as it leaves a game when hosting
+		if (state.buttons & (1U << SDL_CONTROLLER_BUTTON_MISC1))
+			break;
 		if ((state != sent) || (now - last_sent >= INPUT_REFRESH))
 		{
 			link.send_input(state);

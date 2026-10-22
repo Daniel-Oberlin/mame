@@ -11,6 +11,7 @@ import org.libsdl.app.SDLActivity;
 import android.view.*;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
+import android.net.wifi.WifiManager;
 /**
     SDL Activity
 */
@@ -24,7 +25,16 @@ public class MAME extends SDLActivity {
 		copyAssetAll("language");
 		copyAssetAll("plugins", true);
 		copyAssetAll("plugin.ini");
+
+		// Wi-Fi may drop broadcasts to save power; network play finds hosts by them
+		WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+		if (wifi != null) {
+			mMulticastLock = wifi.createMulticastLock("MAME4Quest network play");
+			mMulticastLock.acquire();
+		}
     }
+
+	private WifiManager.MulticastLock mMulticastLock;
 
 	@Override
 	protected void onDestroy() {
