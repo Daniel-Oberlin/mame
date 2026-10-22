@@ -41,6 +41,8 @@
 #endif
 #endif
 
+#include "../quest/questnet.h"
+
 // standard includes
 #if !defined(SDLMAME_WIN32)
 #include <unistd.h>
@@ -71,6 +73,15 @@ int main(int argc, char** argv)
 {
 	std::vector<std::string> args = osd_get_command_line(argc, argv);
 	int res = 0;
+
+#if !defined(SDLMAME_ANDROID)
+	// -join runs a network guest instead of MAME
+	{
+		osd::quest::net::guest_options guest;
+		if (osd::quest::net::parse_guest_options(args, guest))
+			return osd::quest::net::guest_main(guest);
+	}
+#endif
 
 	// disable I/O buffering
 	setvbuf(stdout, (char *) nullptr, _IONBF, 0);

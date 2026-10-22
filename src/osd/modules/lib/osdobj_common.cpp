@@ -24,10 +24,15 @@
 
 #include "watchdog.h"
 
+#if defined(OSD_SDL)
+#include "quest/questnet.h"
+#endif
+
 #include "emu.h"
 #include "../frontend/mame/ui/menuitem.h"
 
 #include <iostream>
+#include <map>
 
 
 const options_entry osd_options::s_option_entries[] =
@@ -147,6 +152,9 @@ const options_entry osd_options::s_option_entries[] =
 	{ OSDOPTION_SOUND,                           OSDOPTVAL_AUTO,   core_options::option_type::STRING,    "sound output method: " },
 	{ OSDOPTION_AUDIO_LATENCY ";alat(0.0-50.0)", "0.0",            core_options::option_type::FLOAT,     "audio latency, 0 for default (increase to reduce glitches, decrease for responsiveness)" },
 
+	{ nullptr,                                   nullptr,          core_options::option_type::HEADER,    "OSD NETWORK PLAY OPTIONS" },
+	{ OSDOPTION_HOST,                            "0",              core_options::option_type::BOOLEAN,   "share the game with players on the local network" },
+
 	{ nullptr,                                   nullptr,          core_options::option_type::HEADER,    "OSD MIDI OPTIONS" },
 	{ OSDOPTION_MIDI_PROVIDER,                   OSDOPTVAL_AUTO,   core_options::option_type::STRING,    "MIDI I/O method: " },
 
@@ -250,6 +258,9 @@ void osd_common_t::register_options()
 #if !defined(SDLMAME_EMSCRIPTEN)
 	REGISTER_MODULE(m_mod_man, RENDERER_SDL1);
 #endif
+#endif
+#if !defined(SDLMAME_ANDROID)
+	REGISTER_MODULE(m_mod_man, RENDERER_QUEST); // the Quest's renderer in a desktop window, for multiplayer development
 #endif
 	REGISTER_MODULE(m_mod_man, RENDERER_NONE);
 
@@ -538,9 +549,25 @@ osd::audio_info osd_common_t::sound_get_information()
 	return m_sound->get_information();
 }
 
+#if defined(OSD_SDL)
+namespace {
+
+// channels and sample rate of each output stream, for network guests
+struct net_stream_format { int channels; int rate; };
+std::map<uint32_t, net_stream_format> s_net_streams;
+
+} // anonymous namespace
+#endif
+
 uint32_t osd_common_t::sound_stream_sink_open(uint32_t node, std::string name, uint32_t rate)
 {
-	return m_sound->stream_sink_open(node, name, rate);
+	uint32_t const id = m_sound->stream_sink_open(node, name, rate);
+#if defined(OSD_SDL)
+	for (auto const &info : m_sound->get_information().m_nodes)
+		if (info.m_id == node)
+			s_net_streams[id] = { int(info.m_sinks), int(rate) };
+#endif
+	return id;
 }
 
 uint32_t osd_common_t::sound_stream_source_open(uint32_t node, std::string name, uint32_t rate)
@@ -555,11 +582,20 @@ void osd_common_t::sound_stream_set_volumes(uint32_t id, const std::vector<float
 
 void osd_common_t::sound_stream_close(uint32_t id)
 {
+#if defined(OSD_SDL)
+	s_net_streams.erase(id);
+#endif
 	m_sound->stream_close(id);
 }
 
 void osd_common_t::sound_stream_sink_update(uint32_t id, const int16_t *buffer, int samples_this_frame)
 {
+#if defined(OSD_SDL)
+	// guests hear the lowest-numbered stream, which is all there is unless sound is
+	// split per source
+	if (osd::quest::net::hosting() && !s_net_streams.empty() && (s_net_streams.begin()->first == id))
+		osd::quest::net::host_audio(buffer, samples_this_frame, s_net_streams.begin()->second.channels, s_net_streams.begin()->second.rate);
+#endif
 	m_sound->stream_sink_update(id, buffer, samples_this_frame);
 }
 
@@ -709,6 +745,12 @@ bool osd_common_t::execute_command(const char *command)
 
 void osd_common_t::init_subsystems()
 {
+#if defined(OSD_SDL)
+	// before input starts, so the guests' gamepads are there to be found
+	if (options().host() && !osd::quest::net::host_start())
+		osd_printf_error("Could not start hosting network play\n");
+#endif
+
 	// monitors have to be initialized before video init
 	m_monitor_module = &select_module_options<monitor_module>(OSD_MONITOR_PROVIDER);
 

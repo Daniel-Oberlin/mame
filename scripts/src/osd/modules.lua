@@ -158,16 +158,29 @@ function osdmodulesbuild()
 		ext_includedir("asio"),
 	}
 
+	files {
+		MAME_DIR .. "src/osd/modules/render/drawquest.cpp",
+		MAME_DIR .. "src/osd/quest/questdisplay.cpp",
+		MAME_DIR .. "src/osd/quest/questdisplay.h",
+		MAME_DIR .. "src/osd/quest/questguest.cpp",
+		MAME_DIR .. "src/osd/quest/questnet.cpp",
+		MAME_DIR .. "src/osd/quest/questnet.h",
+		MAME_DIR .. "src/osd/quest/questnetlog.h",
+		MAME_DIR .. "src/osd/quest/questnetproto.h",
+	}
+	includedirs {
+		MAME_DIR .. "src/osd/quest",
+		ext_includedir("zstd"),
+	}
+
 	if _OPTIONS["targetos"]=="android" then
 		files {
-			MAME_DIR .. "src/osd/modules/render/drawquest.cpp",
 			MAME_DIR .. "src/osd/quest/questxr.cpp",
 			MAME_DIR .. "src/osd/quest/questxr.h",
 			MAME_DIR .. "src/osd/quest/questanchor.cpp",
 			MAME_DIR .. "src/osd/quest/questanchor.h",
 		}
 		includedirs {
-			MAME_DIR .. "src/osd/quest",
 			(os.getenv("OPENXR_SDK_ROOT") or "") .. "/include",
 		}
 	end

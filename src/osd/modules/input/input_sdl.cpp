@@ -23,6 +23,7 @@
 
 #include "interface/inputseq.h"
 #include "modules/lib/osdobj_common.h"
+#include "quest/questnet.h"
 #include "sdl/osdsdl.h"
 
 // emu
@@ -2142,12 +2143,18 @@ public:
 
 // Virtual joysticks (e.g. the Quest Touch controller bridge) are listed first
 // so they become joystick 1 and pick up the default input assignments.
+// Network guests' gamepads follow the local one, making them players 2 and up.
 std::vector<int> joystick_enumeration_order()
 {
 	std::vector<int> order(SDL_NumJoysticks());
 	for (int i = 0; i < int(order.size()); i++)
 		order[i] = i;
 	auto const physical = std::stable_partition(order.begin(), order.end(), [] (int index) { return SDL_JoystickIsVirtual(index); });
+	std::stable_partition(order.begin(), physical, [] (int index)
+			{
+				char const *const name = SDL_JoystickNameForIndex(index);
+				return !name || std::strncmp(name, osd::quest::net::GUEST_PAD_NAME, std::strlen(osd::quest::net::GUEST_PAD_NAME));
+			});
 
 #if defined(SDLMAME_ANDROID)
 	// on Quest the system also exposes the Touch controllers as Android input

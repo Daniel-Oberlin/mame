@@ -52,6 +52,7 @@
 #define OSDOPTION_BENCH                 "bench"
 
 #define OSDOPTION_VIDEO                 "video"
+#define OSDOPTION_HOST                  "host"
 #define OSDOPTION_NUMSCREENS            "numscreens"
 #define OSDOPTION_WINDOW                "window"
 #define OSDOPTION_MAXIMIZE              "maximize"
@@ -121,6 +122,9 @@ public:
 	// performance options
 	const char *numprocessors() const { return value(OSDOPTION_NUMPROCESSORS); }
 	int bench() const { return int_value(OSDOPTION_BENCH); }
+
+	// network play options
+	bool host() const { return bool_value(OSDOPTION_HOST); }
 
 	// video options
 	const char *video() const { return value(OSDOPTION_VIDEO); }
